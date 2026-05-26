@@ -6,7 +6,7 @@ import time as time_lib
 import io
 
 # 1. Configuración Minimalista de la página
-st.set_page_config(page_title="Consolidador Shopify", layout="centered")
+st.set_page_config(page_title="Descarga ventas Shopify", layout="centered")
 
 # CSS para ocultar elementos por defecto de Streamlit y dar aspecto limpio
 hide_st_style = """
