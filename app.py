@@ -1,17 +1,29 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime, time
+from datetime import datetime
+import time as time_lib
 import io
 
-# Configuración de la página
-st.set_page_config(page_title="Consolidador de Ventas Multimarca", layout="wide")
+# 1. Configuración Minimalista de la página
+st.set_page_config(page_title="Consolidador Shopify", layout="centered")
+
+# CSS para ocultar elementos por defecto de Streamlit y dar aspecto limpio
+hide_st_style = """
+            <style>
+            #MainMenu {visibility: hidden;}
+            footer {visibility: hidden;}
+            header {visibility: hidden;}
+            .stButton>button {width: 100%; border-radius: 4px;}
+            </style>
+            """
+st.markdown(hide_st_style, unsafe_allow_html=True)
 
 # Mapeo dinámico de credenciales desde st.secrets
 try:
     STORES = st.secrets["stores"]
 except KeyError:
-    st.error("No se encontraron las credenciales en st.secrets. Por favor, verifica la configuración.")
+    st.error("Credenciales no configuradas en st.secrets.")
     st.stop()
 
 def fetch_orders(store_info, start_date, end_date):
@@ -19,9 +31,8 @@ def fetch_orders(store_info, start_date, end_date):
     api_version = "2024-01"
     headers = {"X-Shopify-Access-Token": store_info["token"]}
     
-    # Formatear fechas para la API (ISO 8601 con zona horaria de Argentina -03:00)
-    start_str = datetime.combine(start_date, time.min).isoformat() + "-03:00"
-    end_str = datetime.combine(end_date, time.max).isoformat() + "-03:00"
+    start_str = datetime.combine(start_date, datetime.min.time()).isoformat() + "-03:00"
+    end_str = datetime.combine(end_date, datetime.max.time()).isoformat() + "-03:00"
 
     url = f"https://{store_info['url']}/admin/api/{api_version}/orders.json"
     params = {
@@ -41,7 +52,6 @@ def fetch_orders(store_info, start_date, end_date):
             data = response.json()
             all_orders.extend(data.get("orders", []))
             
-            # Revisar si hay una página siguiente (Paginación de Shopify)
             link_header = response.headers.get("Link")
             if link_header and 'rel="next"' in link_header:
                 links = link_header.split(', ')
@@ -60,15 +70,24 @@ def fetch_orders(store_info, start_date, end_date):
     return all_orders
 
 def process_orders(orders, marca):
-    """Aplana el JSON de Shopify para crear las filas del reporte a nivel de SKU."""
+    """Aplana el JSON y consolida los métodos de pago."""
     rows = []
     for order in orders:
         created_at = datetime.fromisoformat(order["created_at"].replace("Z", "+00:00"))
-        
         shipping_address = order.get("shipping_address", {})
         provincia = shipping_address.get("province", "") if shipping_address else ""
         
-        gateways = ", ".join(order.get("payment_gateway_names", []))
+        # 2. Lógica de consolidación de métodos de pago
+        gateways_raw = ", ".join(order.get("payment_gateway_names", [])).lower()
+        if "mercado" in gateways_raw or "mercadopago" in gateways_raw:
+            metodo_pago = "Mercado Pago"
+        elif "mobbex" in gateways_raw:
+            metodo_pago = "Mobbex"
+        elif "reversso" in gateways_raw:
+            metodo_pago = "Reversso"
+        else:
+            # Fallback en caso de que sea otro método (ej: Transferencia, Custom)
+            metodo_pago = ", ".join(order.get("payment_gateway_names", [])).title()
         
         for line in order.get("line_items", []):
             row = {
@@ -86,62 +105,71 @@ def process_orders(orders, marca):
                 "ESTADO DEL PAGO": order.get("financial_status", ""),
                 "ESTADO": order.get("fulfillment_status", "unfulfilled") or "unfulfilled",
                 "ENVIO": order.get("shipping_lines", [{}])[0].get("title", "") if order.get("shipping_lines") else "",
-                "METODO DE PAGO": gateways
+                "METODO DE PAGO": metodo_pago
             }
             rows.append(row)
     return rows
 
-# --- Interfaz de Usuario de Streamlit ---
-st.title("📦 Extractor Multimarca de Ventas Shopify")
-st.markdown("Descargá el reporte consolidado de pedidos para todas las marcas seleccionadas.")
+# --- Interfaz de Usuario ---
+st.title("Consolidador Shopify")
+st.write("---")
 
-# Filtros
 col1, col2 = st.columns(2)
 with col1:
     date_range = st.date_input("Rango de Fechas", [])
 with col2:
-    # Toma las marcas disponibles dinámicamente desde lo configurado en los secrets
     available_brands = list(STORES.keys())
-    selected_brands = st.multiselect("Marcas a extraer", available_brands, default=available_brands)
+    selected_brands = st.multiselect("Marcas", available_brands, default=available_brands)
+
+st.write("") # Espaciador
 
 if st.button("Generar Reporte", type="primary"):
     if len(date_range) != 2:
-        st.warning("Por favor selecciona una fecha de inicio y una fecha de fin.")
+        st.warning("Seleccioná fecha de inicio y fin.")
     elif not selected_brands:
-        st.warning("Por favor selecciona al menos una marca.")
+        st.warning("Seleccioná al menos una marca.")
     else:
         start_date, end_date = date_range
         all_data = []
         
+        # 3. Inicio del cronómetro
+        start_time = time_lib.time()
+        
         progress_bar = st.progress(0)
-        status_text = st.empty()
         
         for i, marca in enumerate(selected_brands):
-            status_text.text(f"Extrayendo datos de {marca}...")
             raw_orders = fetch_orders(STORES[marca], start_date, end_date)
             processed_rows = process_orders(raw_orders, marca)
             all_data.extend(processed_rows)
-            
             progress_bar.progress((i + 1) / len(selected_brands))
             
-        status_text.text("¡Extracción completada!")
+        # Fin del cronómetro
+        end_time = time_lib.time()
+        elapsed_time = round(end_time - start_time, 2)
+        
+        # Limpiar barra de progreso para mantener diseño limpio
+        progress_bar.empty()
         
         if all_data:
             df = pd.DataFrame(all_data)
             
-            st.subheader("Vista previa de los datos")
-            st.dataframe(df.head(100), use_container_width=True)
-            
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Reporte Ventas')
+                df.to_excel(writer, index=False, sheet_name='Ventas')
             processed_data = output.getvalue()
             
+            # Mensaje de éxito limpio con el tiempo de ejecución
+            st.success(f"Reporte procesado exitosamente en {elapsed_time} segundos.")
+            
+            # Vista previa contenida en un expander para no saturar la pantalla
+            with st.expander("Ver vista previa de los datos"):
+                st.dataframe(df.head(50), use_container_width=True)
+            
             st.download_button(
-                label="📥 Descargar Reporte en Excel (.xlsx)",
+                label="Descargar Archivo",
                 data=processed_data,
-                file_name=f"Reporte_Ventas_{start_date}_al_{end_date}.xlsx",
+                file_name=f"Reporte_{start_date}_al_{end_date}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.info("No se encontraron pedidos en el rango de fechas seleccionado para estas marcas.")
+            st.info("No se registraron ventas en el período seleccionado.")
