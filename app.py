@@ -69,15 +69,52 @@ def fetch_orders(store_info, start_date, end_date):
         
     return all_orders
 
-def process_orders(orders, marca):
-    """Aplana el JSON y consolida los métodos de pago."""
+def get_product_tags(product_id, store_info, cache):
+    """Consulta la API de productos para obtener los tags. Usa caché para optimizar velocidad."""
+    if not product_id:
+        return ""
+    
+    # Si ya lo consultamos antes en esta ejecución, lo devolvemos rápido
+    if product_id in cache:
+        return cache[product_id]
+        
+    api_version = "2024-01"
+    url = f"https://{store_info['url']}/admin/api/{api_version}/products/{product_id}.json?fields=tags"
+    headers = {"X-Shopify-Access-Token": store_info["token"]}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            tags = response.json().get("product", {}).get("tags", "")
+            cache[product_id] = tags
+            return tags
+        elif response.status_code == 429: # Manejo de límite de la API (Rate Limit)
+            time_lib.sleep(1)
+            return get_product_tags(product_id, store_info, cache)
+        else:
+            cache[product_id] = ""
+            return ""
+    except Exception:
+        cache[product_id] = ""
+        return ""
+
+def process_orders(orders, marca, store_info, product_cache):
+    """Aplana el JSON, consolida los métodos de pago y suma datos del cliente y tags."""
     rows = []
     for order in orders:
         created_at = datetime.fromisoformat(order["created_at"].replace("Z", "+00:00"))
         shipping_address = order.get("shipping_address", {})
         provincia = shipping_address.get("province", "") if shipping_address else ""
         
-        # 2. Lógica de consolidación de métodos de pago
+        # --- NUEVO: Extraer Nombre, Apellido y Email del Cliente ---
+        customer = order.get("customer", {})
+        nombre_cliente = customer.get("first_name", "") or ""
+        apellido_cliente = customer.get("last_name", "") or ""
+        nombre_apellido = f"{nombre_cliente} {apellido_cliente}".strip()
+        
+        email = order.get("email", "") or order.get("contact_email", "")
+        
+        # Lógica de consolidación de métodos de pago
         gateways_raw = ", ".join(order.get("payment_gateway_names", [])).lower()
         if "mercado" in gateways_raw or "mercadopago" in gateways_raw:
             metodo_pago = "Mercado Pago"
@@ -90,13 +127,21 @@ def process_orders(orders, marca):
             metodo_pago = ", ".join(order.get("payment_gateway_names", [])).title()
         
         for line in order.get("line_items", []):
+            product_id = line.get("product_id")
+            
+            # --- NUEVO: Obtener tags del producto usando el caché ---
+            tags_producto = get_product_tags(product_id, store_info, product_cache)
+            
             row = {
+                "NOMBRE Y APELLIDO": nombre_apellido,
+                "EMAIL": email,
                 "MARCA": marca,
                 "PEDIDO": order.get("name", ""),
                 "FECHA": created_at.strftime("%d/%m/%Y"),
                 "HORA": created_at.strftime("%H:%M:%S"),
                 "PROVINCIA": provincia,
                 "SKU": line.get("sku", ""),
+                "TAGS PRODUCTO": tags_producto,
                 "MODELO / COLOR": line.get("variant_title", ""),
                 "DESCRIPCION": line.get("title", ""),
                 "CANTIDAD": line.get("quantity", 0),
@@ -132,14 +177,19 @@ if st.button("Generar Reporte", type="primary"):
         start_date, end_date = date_range
         all_data = []
         
-        # 3. Inicio del cronómetro
+        # Diccionario global para guardar tags de productos durante este reporte y ahorrar tiempo
+        product_cache = {}
+        
+        # Inicio del cronómetro
         start_time = time_lib.time()
         
+        st.info("Obteniendo pedidos y consultando etiquetas de productos. Esto puede demorar un poco más...")
         progress_bar = st.progress(0)
         
         for i, marca in enumerate(selected_brands):
             raw_orders = fetch_orders(STORES[marca], start_date, end_date)
-            processed_rows = process_orders(raw_orders, marca)
+            # Pasamos la info de la tienda y el caché a la función que procesa las órdenes
+            processed_rows = process_orders(raw_orders, marca, STORES[marca], product_cache)
             all_data.extend(processed_rows)
             progress_bar.progress((i + 1) / len(selected_brands))
             
