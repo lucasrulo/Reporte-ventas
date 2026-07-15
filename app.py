@@ -74,7 +74,6 @@ def get_product_tags(product_id, store_info, cache):
     if not product_id:
         return ""
     
-    # Si ya lo consultamos antes en esta ejecución, lo devolvemos rápido
     if product_id in cache:
         return cache[product_id]
         
@@ -88,7 +87,7 @@ def get_product_tags(product_id, store_info, cache):
             tags = response.json().get("product", {}).get("tags", "")
             cache[product_id] = tags
             return tags
-        elif response.status_code == 429: # Manejo de límite de la API (Rate Limit)
+        elif response.status_code == 429:
             time_lib.sleep(1)
             return get_product_tags(product_id, store_info, cache)
         else:
@@ -106,7 +105,6 @@ def process_orders(orders, marca, store_info, product_cache):
         shipping_address = order.get("shipping_address", {})
         provincia = shipping_address.get("province", "") if shipping_address else ""
         
-        # --- NUEVO: Extraer Nombre, Apellido y Email del Cliente ---
         customer = order.get("customer", {})
         nombre_cliente = customer.get("first_name", "") or ""
         apellido_cliente = customer.get("last_name", "") or ""
@@ -114,7 +112,6 @@ def process_orders(orders, marca, store_info, product_cache):
         
         email = order.get("email", "") or order.get("contact_email", "")
         
-        # Lógica de consolidación de métodos de pago
         gateways_raw = ", ".join(order.get("payment_gateway_names", [])).lower()
         if "mercado" in gateways_raw or "mercadopago" in gateways_raw:
             metodo_pago = "Mercado Pago"
@@ -123,13 +120,19 @@ def process_orders(orders, marca, store_info, product_cache):
         elif "reversso" in gateways_raw:
             metodo_pago = "Reversso"
         else:
-            # Fallback en caso de que sea otro método (ej: Transferencia, Custom)
             metodo_pago = ", ".join(order.get("payment_gateway_names", [])).title()
+        
+        # Lógica de estado de preparación
+        fulfillment_status = order.get("fulfillment_status")
+        if fulfillment_status == "fulfilled":
+            estado_preparacion = "Preparado"
+        elif fulfillment_status == "partial":
+            estado_preparacion = "Preparación Parcial"
+        else:
+            estado_preparacion = "No preparado"
         
         for line in order.get("line_items", []):
             product_id = line.get("product_id")
-            
-            # --- NUEVO: Obtener tags del producto usando el caché ---
             tags_producto = get_product_tags(product_id, store_info, product_cache)
             
             row = {
@@ -150,7 +153,8 @@ def process_orders(orders, marca, store_info, product_cache):
                 "ESTADO DEL PAGO": order.get("financial_status", ""),
                 "ESTADO": order.get("fulfillment_status", "unfulfilled") or "unfulfilled",
                 "ENVIO": order.get("shipping_lines", [{}])[0].get("title", "") if order.get("shipping_lines") else "",
-                "METODO DE PAGO": metodo_pago
+                "METODO DE PAGO": metodo_pago,
+                "ESTADO PREPARACION": estado_preparacion
             }
             rows.append(row)
     return rows
@@ -166,7 +170,7 @@ with col2:
     available_brands = list(STORES.keys())
     selected_brands = st.multiselect("Marcas", available_brands, default=available_brands)
 
-st.write("") # Espaciador
+st.write("") 
 
 if st.button("Generar Reporte", type="primary"):
     if len(date_range) != 2:
@@ -176,11 +180,8 @@ if st.button("Generar Reporte", type="primary"):
     else:
         start_date, end_date = date_range
         all_data = []
-        
-        # Diccionario global para guardar tags de productos durante este reporte y ahorrar tiempo
         product_cache = {}
         
-        # Inicio del cronómetro
         start_time = time_lib.time()
         
         st.info("Obteniendo pedidos y consultando etiquetas de productos. Esto puede demorar un poco más...")
@@ -188,16 +189,13 @@ if st.button("Generar Reporte", type="primary"):
         
         for i, marca in enumerate(selected_brands):
             raw_orders = fetch_orders(STORES[marca], start_date, end_date)
-            # Pasamos la info de la tienda y el caché a la función que procesa las órdenes
             processed_rows = process_orders(raw_orders, marca, STORES[marca], product_cache)
             all_data.extend(processed_rows)
             progress_bar.progress((i + 1) / len(selected_brands))
             
-        # Fin del cronómetro
         end_time = time_lib.time()
         elapsed_time = round(end_time - start_time, 2)
         
-        # Limpiar barra de progreso para mantener diseño limpio
         progress_bar.empty()
         
         if all_data:
@@ -208,10 +206,8 @@ if st.button("Generar Reporte", type="primary"):
                 df.to_excel(writer, index=False, sheet_name='Ventas')
             processed_data = output.getvalue()
             
-            # Mensaje de éxito limpio con el tiempo de ejecución
             st.success(f"Reporte procesado exitosamente en {elapsed_time} segundos.")
             
-            # Vista previa contenida en un expander para no saturar la pantalla
             with st.expander("Ver vista previa de los datos"):
                 st.dataframe(df.head(50), use_container_width=True)
             
