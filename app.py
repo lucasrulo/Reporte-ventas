@@ -98,12 +98,30 @@ def get_product_tags(product_id, store_info, cache):
         return ""
 
 def process_orders(orders, marca, store_info, product_cache):
-    """Aplana el JSON y añade estados precisos de Shopify."""
+    """Aplana el JSON y suma datos del cliente y tags manteniendo todas las columnas."""
     rows = []
     for order in orders:
         created_at = datetime.fromisoformat(order["created_at"].replace("Z", "+00:00"))
+        shipping_address = order.get("shipping_address", {})
+        provincia = shipping_address.get("province", "") if shipping_address else ""
         
-        # --- Lógica de Estados ---
+        customer = order.get("customer", {})
+        nombre_cliente = customer.get("first_name", "") or ""
+        apellido_cliente = customer.get("last_name", "") or ""
+        nombre_apellido = f"{nombre_cliente} {apellido_cliente}".strip()
+        email = order.get("email", "") or order.get("contact_email", "")
+        
+        gateways_raw = ", ".join(order.get("payment_gateway_names", [])).lower()
+        if "mercado" in gateways_raw or "mercadopago" in gateways_raw:
+            metodo_pago = "Mercado Pago"
+        elif "mobbex" in gateways_raw:
+            metodo_pago = "Mobbex"
+        elif "reversso" in gateways_raw:
+            metodo_pago = "Reversso"
+        else:
+            metodo_pago = ", ".join(order.get("payment_gateway_names", [])).title()
+        
+        # --- Lógica de estados nuevos ---
         estado_cancelacion = "Cancelado" if order.get("cancelled_at") else "Activo"
         
         fulfillment_status = order.get("fulfillment_status")
@@ -115,10 +133,6 @@ def process_orders(orders, marca, store_info, product_cache):
             estado_preparacion = "No requiere preparación" 
         else:
             estado_preparacion = fulfillment_status.replace("_", " ").title()
-
-        customer = order.get("customer", {})
-        nombre_apellido = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
-        email = order.get("email", "") or order.get("contact_email", "")
         
         for line in order.get("line_items", []):
             product_id = line.get("product_id")
@@ -131,9 +145,18 @@ def process_orders(orders, marca, store_info, product_cache):
                 "PEDIDO": order.get("name", ""),
                 "FECHA": created_at.strftime("%d/%m/%Y"),
                 "HORA": created_at.strftime("%H:%M:%S"),
+                "PROVINCIA": provincia,
                 "SKU": line.get("sku", ""),
                 "TAGS PRODUCTO": tags_producto,
                 "MODELO / COLOR": line.get("variant_title", ""),
+                "DESCRIPCION": line.get("title", ""),
+                "CANTIDAD": line.get("quantity", 0),
+                "PRECIO UNITARIO": float(line.get("price", 0.00)),
+                "TOTAL PEDIDO": float(order.get("total_price", 0.00)),
+                "ESTADO DEL PAGO": order.get("financial_status", ""),
+                "ESTADO": order.get("fulfillment_status", "unfulfilled") or "unfulfilled",
+                "ENVIO": order.get("shipping_lines", [{}])[0].get("title", "") if order.get("shipping_lines") else "",
+                "METODO DE PAGO": metodo_pago,
                 "ESTADO CANCELACION": estado_cancelacion,
                 "ESTADO PREPARACION": estado_preparacion
             }
@@ -151,6 +174,8 @@ with col2:
     available_brands = list(STORES.keys())
     selected_brands = st.multiselect("Marcas", available_brands, default=available_brands)
 
+st.write("") 
+
 if st.button("Generar Reporte", type="primary"):
     if len(date_range) != 2:
         st.warning("Seleccioná fecha de inicio y fin.")
@@ -161,10 +186,14 @@ if st.button("Generar Reporte", type="primary"):
         all_data = []
         product_cache = {}
         
+        start_time = time_lib.time()
+        st.info("Obteniendo pedidos...")
         progress_bar = st.progress(0)
+        
         for i, marca in enumerate(selected_brands):
             raw_orders = fetch_orders(STORES[marca], start_date, end_date)
-            all_data.extend(process_orders(raw_orders, marca, STORES[marca], product_cache))
+            processed_rows = process_orders(raw_orders, marca, STORES[marca], product_cache)
+            all_data.extend(processed_rows)
             progress_bar.progress((i + 1) / len(selected_brands))
             
         progress_bar.empty()
@@ -175,7 +204,16 @@ if st.button("Generar Reporte", type="primary"):
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Ventas')
             
-            st.success("Reporte generado.")
-            st.download_button("Descargar Archivo", data=output.getvalue(), file_name="Reporte_Ventas.xlsx")
+            st.success(f"Reporte procesado.")
+            
+            with st.expander("Ver vista previa"):
+                st.dataframe(df.head(50), use_container_width=True)
+            
+            st.download_button(
+                label="Descargar Archivo",
+                data=output.getvalue(),
+                file_name=f"Reporte_{start_date}_al_{end_date}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
         else:
-            st.info("No hay ventas en el período.")
+            st.info("No se registraron ventas en el período seleccionado.")
