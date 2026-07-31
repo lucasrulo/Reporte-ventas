@@ -97,8 +97,66 @@ def get_product_tags(product_id, store_info, cache):
         cache[product_id] = ""
         return ""
 
-def process_orders(orders, marca, store_info, product_cache):
-    """Aplana el JSON y suma datos del cliente y tags manteniendo todas las columnas."""
+def get_payment_id(order_id, store_info, cache):
+    """
+    Consulta la API de transacciones del pedido para obtener el 'ID de pago'
+    que se ve en el timeline de Shopify (ej: para Mobbex o Mercado Pago).
+
+    Ese ID no viene en un campo estándar único: según la pasarela, puede
+    estar en 'authorization' o dentro del diccionario 'receipt' con distintas
+    claves. Probamos las más comunes en orden de prioridad.
+    """
+    if not order_id:
+        return ""
+
+    if order_id in cache:
+        return cache[order_id]
+
+    api_version = "2024-01"
+    url = f"https://{store_info['url']}/admin/api/{api_version}/orders/{order_id}/transactions.json"
+    headers = {"X-Shopify-Access-Token": store_info["token"]}
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            transactions = response.json().get("transactions", [])
+            payment_id = ""
+
+            # Priorizamos transacciones exitosas de tipo venta/captura
+            candidatas = [
+                t for t in transactions
+                if t.get("status") == "success" and t.get("kind") in ("sale", "capture")
+            ]
+            if not candidatas:
+                candidatas = transactions  # fallback: cualquier transacción
+
+            for t in candidatas:
+                receipt = t.get("receipt") or {}
+                payment_id = (
+                    t.get("authorization")
+                    or receipt.get("id")
+                    or receipt.get("payment_id")
+                    or receipt.get("gateway_transaction_id")
+                    or receipt.get("transaction_id")
+                    or ""
+                )
+                if payment_id:
+                    break
+
+            cache[order_id] = payment_id
+            return payment_id
+        elif response.status_code == 429:
+            time_lib.sleep(1)
+            return get_payment_id(order_id, store_info, cache)
+        else:
+            cache[order_id] = ""
+            return ""
+    except Exception:
+        cache[order_id] = ""
+        return ""
+
+def process_orders(orders, marca, store_info, product_cache, payment_cache):
+    """Aplana el JSON y suma datos del cliente, tags e ID de pago manteniendo todas las columnas."""
     rows = []
     for order in orders:
         created_at = datetime.fromisoformat(order["created_at"].replace("Z", "+00:00"))
@@ -133,6 +191,9 @@ def process_orders(orders, marca, store_info, product_cache):
             estado_preparacion = "No requiere preparación" 
         else:
             estado_preparacion = fulfillment_status.replace("_", " ").title()
+
+        # --- ID de pago (una consulta por pedido, cacheada) ---
+        id_pago = get_payment_id(order.get("id"), store_info, payment_cache)
         
         for line in order.get("line_items", []):
             product_id = line.get("product_id")
@@ -158,7 +219,8 @@ def process_orders(orders, marca, store_info, product_cache):
                 "ENVIO": order.get("shipping_lines", [{}])[0].get("title", "") if order.get("shipping_lines") else "",
                 "METODO DE PAGO": metodo_pago,
                 "ESTADO CANCELACION": estado_cancelacion,
-                "ESTADO PREPARACION": estado_preparacion
+                "ESTADO PREPARACION": estado_preparacion,
+                "ID DE PAGO": id_pago
             }
             rows.append(row)
     return rows
@@ -185,6 +247,7 @@ if st.button("Generar Reporte", type="primary"):
         start_date, end_date = date_range
         all_data = []
         product_cache = {}
+        payment_cache = {}
         
         start_time = time_lib.time()
         st.info("Obteniendo pedidos...")
@@ -192,7 +255,7 @@ if st.button("Generar Reporte", type="primary"):
         
         for i, marca in enumerate(selected_brands):
             raw_orders = fetch_orders(STORES[marca], start_date, end_date)
-            processed_rows = process_orders(raw_orders, marca, STORES[marca], product_cache)
+            processed_rows = process_orders(raw_orders, marca, STORES[marca], product_cache, payment_cache)
             all_data.extend(processed_rows)
             progress_bar.progress((i + 1) / len(selected_brands))
             
