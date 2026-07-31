@@ -274,7 +274,8 @@ def test_query_permissions(store_info, start_str, end_str):
     }}
     """
     resp = requests.post(graphql_url(store_info), headers=graphql_headers(store_info), json={"query": test_query})
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code} — {resp.text[:300]}")
     data = resp.json()
     if "errors" in data:
         mensajes = "; ".join(e.get("message", "") for e in data["errors"])
@@ -369,6 +370,11 @@ if st.button("Generar Reporte", type="primary"):
                 orders = build_orders_from_bulk(raw_rows)
                 processed_rows = process_orders_bulk(orders, marca)
                 all_data.extend(processed_rows)
+
+                st.caption(
+                    f"🔍 {marca}: {len(raw_rows)} objetos descargados del bulk, "
+                    f"{len(orders)} pedidos reconocidos, {len(processed_rows)} filas generadas."
+                )
             except RuntimeError as e:
                 st.error(f"{marca}: error durante la exportación — {e}")
 
