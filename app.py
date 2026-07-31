@@ -4,6 +4,8 @@ import pandas as pd
 from datetime import datetime
 import time as time_lib
 import io
+import threading
+import concurrent.futures
 
 # 1. Configuración Minimalista de la página
 st.set_page_config(page_title="Descarga ventas Shopify", layout="centered")
@@ -26,7 +28,28 @@ except KeyError:
     st.error("Credenciales no configuradas en st.secrets.")
     st.stop()
 
-def fetch_orders(store_info, start_date, end_date):
+
+class RateLimiter:
+    """
+    Limita la cantidad de llamados por segundo a la API de una tienda para
+    evitar disparar el rate limit de Shopify (lo que generaba muchos 429
+    y reintentos de 1 segundo en cascada, haciendo el reporte eterno).
+    """
+    def __init__(self, min_interval=0.55):
+        self.min_interval = min_interval
+        self.lock = threading.Lock()
+        self.last_call = 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time_lib.time()
+            elapsed = now - self.last_call
+            if elapsed < self.min_interval:
+                time_lib.sleep(self.min_interval - elapsed)
+            self.last_call = time_lib.time()
+
+
+def fetch_orders(store_info, start_date, end_date, rate_limiter):
     """Obtiene los pedidos de la API de Shopify manejando la paginación."""
     api_version = "2024-01"
     headers = {"X-Shopify-Access-Token": store_info["token"]}
@@ -45,6 +68,7 @@ def fetch_orders(store_info, start_date, end_date):
     all_orders = []
     
     try:
+        rate_limiter.wait()
         response = requests.get(url, headers=headers, params=params)
         response.raise_for_status()
         
@@ -58,6 +82,7 @@ def fetch_orders(store_info, start_date, end_date):
                 next_link = [link for link in links if 'rel="next"' in link]
                 if next_link:
                     next_url = next_link[0].split(';')[0].strip('<>')
+                    rate_limiter.wait()
                     response = requests.get(next_url, headers=headers)
                 else:
                     break
@@ -69,35 +94,35 @@ def fetch_orders(store_info, start_date, end_date):
         
     return all_orders
 
-def get_product_tags(product_id, store_info, cache):
-    """Consulta la API de productos para obtener los tags."""
+
+def get_product_tags(product_id, store_info, rate_limiter):
+    """Consulta la API de productos para obtener los tags de un producto puntual."""
     if not product_id:
-        return ""
-    
-    if product_id in cache:
-        return cache[product_id]
-        
+        return product_id, ""
+
     api_version = "2024-01"
     url = f"https://{store_info['url']}/admin/api/{api_version}/products/{product_id}.json?fields=tags"
     headers = {"X-Shopify-Access-Token": store_info["token"]}
-    
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            tags = response.json().get("product", {}).get("tags", "")
-            cache[product_id] = tags
-            return tags
-        elif response.status_code == 429:
-            time_lib.sleep(1)
-            return get_product_tags(product_id, store_info, cache)
-        else:
-            cache[product_id] = ""
-            return ""
-    except Exception:
-        cache[product_id] = ""
-        return ""
 
-def get_payment_id(order_id, store_info, cache):
+    for intento in range(4):
+        rate_limiter.wait()
+        try:
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                tags = response.json().get("product", {}).get("tags", "")
+                return product_id, tags
+            elif response.status_code == 429:
+                espera = float(response.headers.get("Retry-After", 1))
+                time_lib.sleep(espera)
+                continue
+            else:
+                return product_id, ""
+        except Exception:
+            return product_id, ""
+    return product_id, ""
+
+
+def get_payment_id(order_id, store_info, rate_limiter):
     """
     Consulta la API de transacciones del pedido para obtener el 'ID de pago'
     que se ve en el timeline de Shopify (ej: para Mobbex o Mercado Pago).
@@ -107,56 +132,76 @@ def get_payment_id(order_id, store_info, cache):
     claves. Probamos las más comunes en orden de prioridad.
     """
     if not order_id:
-        return ""
-
-    if order_id in cache:
-        return cache[order_id]
+        return order_id, ""
 
     api_version = "2024-01"
     url = f"https://{store_info['url']}/admin/api/{api_version}/orders/{order_id}/transactions.json"
     headers = {"X-Shopify-Access-Token": store_info["token"]}
 
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            transactions = response.json().get("transactions", [])
-            payment_id = ""
+    for intento in range(4):
+        rate_limiter.wait()
+        try:
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                transactions = response.json().get("transactions", [])
 
-            # Priorizamos transacciones exitosas de tipo venta/captura
-            candidatas = [
-                t for t in transactions
-                if t.get("status") == "success" and t.get("kind") in ("sale", "capture")
-            ]
-            if not candidatas:
-                candidatas = transactions  # fallback: cualquier transacción
+                candidatas = [
+                    t for t in transactions
+                    if t.get("status") == "success" and t.get("kind") in ("sale", "capture")
+                ]
+                if not candidatas:
+                    candidatas = transactions  # fallback: cualquier transacción
 
-            for t in candidatas:
-                receipt = t.get("receipt") or {}
-                payment_id = (
-                    t.get("authorization")
-                    or receipt.get("id")
-                    or receipt.get("payment_id")
-                    or receipt.get("gateway_transaction_id")
-                    or receipt.get("transaction_id")
-                    or ""
-                )
-                if payment_id:
-                    break
+                for t in candidatas:
+                    receipt = t.get("receipt") or {}
+                    payment_id = (
+                        t.get("authorization")
+                        or receipt.get("id")
+                        or receipt.get("payment_id")
+                        or receipt.get("gateway_transaction_id")
+                        or receipt.get("transaction_id")
+                        or ""
+                    )
+                    if payment_id:
+                        return order_id, payment_id
+                return order_id, ""
+            elif response.status_code == 429:
+                espera = float(response.headers.get("Retry-After", 1))
+                time_lib.sleep(espera)
+                continue
+            else:
+                return order_id, ""
+        except Exception:
+            return order_id, ""
+    return order_id, ""
 
-            cache[order_id] = payment_id
-            return payment_id
-        elif response.status_code == 429:
-            time_lib.sleep(1)
-            return get_payment_id(order_id, store_info, cache)
-        else:
-            cache[order_id] = ""
-            return ""
-    except Exception:
-        cache[order_id] = ""
-        return ""
 
-def process_orders(orders, marca, store_info, product_cache, payment_cache):
-    """Aplana el JSON y suma datos del cliente, tags e ID de pago manteniendo todas las columnas."""
+def fetch_concurrently(items, worker_fn, store_info, rate_limiter, status_placeholder, label, max_workers=4):
+    """
+    Ejecuta worker_fn(item, store_info, rate_limiter) en paralelo para una lista
+    de items, mostrando progreso en vivo. worker_fn debe devolver (clave, valor).
+    Devuelve un diccionario {clave: valor}.
+    """
+    results = {}
+    total = len(items)
+    if total == 0:
+        return results
+
+    completado = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(worker_fn, item, store_info, rate_limiter) for item in items]
+        for future in concurrent.futures.as_completed(futures):
+            clave, valor = future.result()
+            results[clave] = valor
+            completado += 1
+            if completado % 5 == 0 or completado == total:
+                status_placeholder.text(f"{label}: {completado}/{total}")
+
+    return results
+
+
+def process_orders(orders, marca, product_tags_cache, payment_ids_cache):
+    """Aplana el JSON y arma cada fila usando los caches ya resueltos (sin llamadas a la API)."""
     rows = []
     for order in orders:
         created_at = datetime.fromisoformat(order["created_at"].replace("Z", "+00:00"))
@@ -192,12 +237,11 @@ def process_orders(orders, marca, store_info, product_cache, payment_cache):
         else:
             estado_preparacion = fulfillment_status.replace("_", " ").title()
 
-        # --- ID de pago (una consulta por pedido, cacheada) ---
-        id_pago = get_payment_id(order.get("id"), store_info, payment_cache)
+        id_pago = payment_ids_cache.get(order.get("id"), "")
         
         for line in order.get("line_items", []):
             product_id = line.get("product_id")
-            tags_producto = get_product_tags(product_id, store_info, product_cache)
+            tags_producto = product_tags_cache.get(product_id, "")
             
             row = {
                 "NOMBRE Y APELLIDO": nombre_apellido,
@@ -236,6 +280,8 @@ with col2:
     available_brands = list(STORES.keys())
     selected_brands = st.multiselect("Marcas", available_brands, default=available_brands)
 
+incluir_pago = st.checkbox("Incluir ID de pago (agrega una llamada extra por pedido, más lento)", value=True)
+
 st.write("") 
 
 if st.button("Generar Reporte", type="primary"):
@@ -246,20 +292,44 @@ if st.button("Generar Reporte", type="primary"):
     else:
         start_date, end_date = date_range
         all_data = []
-        product_cache = {}
-        payment_cache = {}
         
         start_time = time_lib.time()
-        st.info("Obteniendo pedidos...")
         progress_bar = st.progress(0)
+        status_placeholder = st.empty()
         
         for i, marca in enumerate(selected_brands):
-            raw_orders = fetch_orders(STORES[marca], start_date, end_date)
-            processed_rows = process_orders(raw_orders, marca, STORES[marca], product_cache, payment_cache)
+            store_info = STORES[marca]
+            rate_limiter = RateLimiter()
+
+            status_placeholder.text(f"{marca}: descargando pedidos...")
+            raw_orders = fetch_orders(store_info, start_date, end_date, rate_limiter)
+
+            # IDs de producto únicos para no pedir tags repetidos
+            product_ids = list({
+                line.get("product_id")
+                for order in raw_orders
+                for line in order.get("line_items", [])
+                if line.get("product_id")
+            })
+            product_tags_cache = fetch_concurrently(
+                product_ids, get_product_tags, store_info, rate_limiter,
+                status_placeholder, f"{marca}: obteniendo tags de productos"
+            )
+
+            payment_ids_cache = {}
+            if incluir_pago:
+                order_ids = [o.get("id") for o in raw_orders if o.get("id")]
+                payment_ids_cache = fetch_concurrently(
+                    order_ids, get_payment_id, store_info, rate_limiter,
+                    status_placeholder, f"{marca}: obteniendo ID de pago"
+                )
+
+            processed_rows = process_orders(raw_orders, marca, product_tags_cache, payment_ids_cache)
             all_data.extend(processed_rows)
             progress_bar.progress((i + 1) / len(selected_brands))
             
         progress_bar.empty()
+        status_placeholder.empty()
         
         if all_data:
             df = pd.DataFrame(all_data)
@@ -267,7 +337,8 @@ if st.button("Generar Reporte", type="primary"):
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Ventas')
             
-            st.success(f"Reporte procesado.")
+            elapsed = time_lib.time() - start_time
+            st.success(f"Reporte procesado en {elapsed/60:.1f} minutos.")
             
             with st.expander("Ver vista previa"):
                 st.dataframe(df.head(50), use_container_width=True)
