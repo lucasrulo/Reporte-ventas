@@ -227,6 +227,60 @@ def process_orders_bulk(orders, marca):
     return rows
 
 
+def test_query_permissions(store_info, start_str, end_str):
+    """
+    Corre la misma consulta pero como GraphQL normal (no bulk), pidiendo un
+    solo pedido. Si falta algún scope, Shopify devuelve acá el detalle exacto
+    (campo + scope requerido) en vez del genérico ACCESS_DENIED del bulk.
+    """
+    test_query = f"""
+    {{
+      orders(first: 1, query: "created_at:>='{start_str}' AND created_at:<='{end_str}' AND status:any") {{
+        edges {{
+          node {{
+            id
+            name
+            createdAt
+            cancelledAt
+            email
+            displayFinancialStatus
+            displayFulfillmentStatus
+            paymentGatewayNames
+            customer {{ firstName lastName }}
+            shippingAddress {{ province }}
+            shippingLine {{ title }}
+            totalPriceSet {{ shopMoney {{ amount }} }}
+            transactions {{
+              kind
+              status
+              paymentId
+              authorizationCode
+            }}
+            lineItems(first: 5) {{
+              edges {{
+                node {{
+                  sku
+                  title
+                  variantTitle
+                  quantity
+                  originalUnitPriceSet {{ shopMoney {{ amount }} }}
+                  product {{ tags }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+    resp = requests.post(graphql_url(store_info), headers=graphql_headers(store_info), json={"query": test_query})
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data:
+        mensajes = "; ".join(e.get("message", "") for e in data["errors"])
+        raise RuntimeError(mensajes)
+
+
 def build_inner_query(start_str, end_str):
     return f"""
     {{
@@ -299,9 +353,11 @@ if st.button("Generar Reporte", type="primary"):
         progress_bar = st.progress(0)
         status_placeholder = st.empty()
 
-        try:
-            for i, marca in enumerate(selected_brands):
-                store_info = STORES[marca]
+        for i, marca in enumerate(selected_brands):
+            store_info = STORES[marca]
+            try:
+                status_placeholder.text(f"{marca}: verificando permisos...")
+                test_query_permissions(store_info, start_str, end_str)
 
                 status_placeholder.text(f"{marca}: iniciando exportación...")
                 inner_query = build_inner_query(start_str, end_str)
@@ -313,11 +369,10 @@ if st.button("Generar Reporte", type="primary"):
                 orders = build_orders_from_bulk(raw_rows)
                 processed_rows = process_orders_bulk(orders, marca)
                 all_data.extend(processed_rows)
+            except RuntimeError as e:
+                st.error(f"{marca}: error durante la exportación — {e}")
 
-                progress_bar.progress((i + 1) / len(selected_brands))
-        except RuntimeError as e:
-            st.error(f"Error durante la exportación: {e}")
-            all_data = []
+            progress_bar.progress((i + 1) / len(selected_brands))
 
         progress_bar.empty()
         status_placeholder.empty()
