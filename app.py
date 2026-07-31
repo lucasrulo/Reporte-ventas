@@ -4,13 +4,11 @@ import pandas as pd
 from datetime import datetime
 import time as time_lib
 import io
-import threading
-import concurrent.futures
+import json
 
 # 1. Configuración Minimalista de la página
 st.set_page_config(page_title="Descarga ventas Shopify", layout="centered")
 
-# CSS para ocultar elementos por defecto de Streamlit y dar aspecto limpio
 hide_st_style = """
             <style>
             #MainMenu {visibility: hidden;}
@@ -21,228 +19,187 @@ hide_st_style = """
             """
 st.markdown(hide_st_style, unsafe_allow_html=True)
 
-# Mapeo dinámico de credenciales desde st.secrets
 try:
     STORES = st.secrets["stores"]
 except KeyError:
     st.error("Credenciales no configuradas en st.secrets.")
     st.stop()
 
-
-class RateLimiter:
-    """
-    Limita la cantidad de llamados por segundo a la API de una tienda para
-    evitar disparar el rate limit de Shopify (lo que generaba muchos 429
-    y reintentos de 1 segundo en cascada, haciendo el reporte eterno).
-    """
-    def __init__(self, min_interval=0.55):
-        self.min_interval = min_interval
-        self.lock = threading.Lock()
-        self.last_call = 0.0
-
-    def wait(self):
-        with self.lock:
-            now = time_lib.time()
-            elapsed = now - self.last_call
-            if elapsed < self.min_interval:
-                time_lib.sleep(self.min_interval - elapsed)
-            self.last_call = time_lib.time()
+API_VERSION = "2024-01"
 
 
-def fetch_orders(store_info, start_date, end_date, rate_limiter):
-    """Obtiene los pedidos de la API de Shopify manejando la paginación."""
-    api_version = "2024-01"
-    headers = {"X-Shopify-Access-Token": store_info["token"]}
-    
-    start_str = datetime.combine(start_date, datetime.min.time()).isoformat() + "-03:00"
-    end_str = datetime.combine(end_date, datetime.max.time()).isoformat() + "-03:00"
+def graphql_url(store_info):
+    return f"https://{store_info['url']}/admin/api/{API_VERSION}/graphql.json"
 
-    url = f"https://{store_info['url']}/admin/api/{api_version}/orders.json"
-    params = {
-        "created_at_min": start_str,
-        "created_at_max": end_str,
-        "status": "any",
-        "limit": 250
+
+def graphql_headers(store_info):
+    return {
+        "X-Shopify-Access-Token": store_info["token"],
+        "Content-Type": "application/json",
     }
 
-    all_orders = []
-    
-    try:
-        rate_limiter.wait()
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        
-        while response.status_code == 200:
-            data = response.json()
-            all_orders.extend(data.get("orders", []))
-            
-            link_header = response.headers.get("Link")
-            if link_header and 'rel="next"' in link_header:
-                links = link_header.split(', ')
-                next_link = [link for link in links if 'rel="next"' in link]
-                if next_link:
-                    next_url = next_link[0].split(';')[0].strip('<>')
-                    rate_limiter.wait()
-                    response = requests.get(next_url, headers=headers)
-                else:
-                    break
-            else:
-                break
-                
-    except Exception as e:
-        st.error(f"Error conectando con {store_info['url']}: {e}")
-        
-    return all_orders
 
-
-def get_product_tags(product_id, store_info, rate_limiter):
-    """Consulta la API de productos para obtener los tags de un producto puntual."""
-    if not product_id:
-        return product_id, ""
-
-    api_version = "2024-01"
-    url = f"https://{store_info['url']}/admin/api/{api_version}/products/{product_id}.json?fields=tags"
-    headers = {"X-Shopify-Access-Token": store_info["token"]}
-
-    for intento in range(4):
-        rate_limiter.wait()
-        try:
-            response = requests.get(url, headers=headers)
-            if response.status_code == 200:
-                tags = response.json().get("product", {}).get("tags", "")
-                return product_id, tags
-            elif response.status_code == 429:
-                espera = float(response.headers.get("Retry-After", 1))
-                time_lib.sleep(espera)
-                continue
-            else:
-                return product_id, ""
-        except Exception:
-            return product_id, ""
-    return product_id, ""
-
-
-def get_payment_id(order_id, store_info, rate_limiter):
+def run_bulk_query(store_info, inner_query):
     """
-    Consulta la API de transacciones del pedido para obtener el 'ID de pago'
-    que se ve en el timeline de Shopify (ej: para Mobbex o Mercado Pago).
-
-    Ese ID no viene en un campo estándar único: según la pasarela, puede
-    estar en 'authorization' o dentro del diccionario 'receipt' con distintas
-    claves. Probamos las más comunes en orden de prioridad.
+    Lanza un Bulk Operation: Shopify arma en background un archivo JSONL
+    con TODOS los pedidos + líneas + tags de producto + transacciones en
+    una sola exportación, sin que tengamos que pedir uno por uno.
     """
-    if not order_id:
-        return order_id, ""
-
-    api_version = "2024-01"
-    url = f"https://{store_info['url']}/admin/api/{api_version}/orders/{order_id}/transactions.json"
-    headers = {"X-Shopify-Access-Token": store_info["token"]}
-
-    for intento in range(4):
-        rate_limiter.wait()
-        try:
-            response = requests.get(url, headers=headers)
-            if response.status_code == 200:
-                transactions = response.json().get("transactions", [])
-
-                candidatas = [
-                    t for t in transactions
-                    if t.get("status") == "success" and t.get("kind") in ("sale", "capture")
-                ]
-                if not candidatas:
-                    candidatas = transactions  # fallback: cualquier transacción
-
-                for t in candidatas:
-                    receipt = t.get("receipt") or {}
-                    payment_id = (
-                        t.get("authorization")
-                        or receipt.get("id")
-                        or receipt.get("payment_id")
-                        or receipt.get("gateway_transaction_id")
-                        or receipt.get("transaction_id")
-                        or ""
-                    )
-                    if payment_id:
-                        return order_id, payment_id
-                return order_id, ""
-            elif response.status_code == 429:
-                espera = float(response.headers.get("Retry-After", 1))
-                time_lib.sleep(espera)
-                continue
-            else:
-                return order_id, ""
-        except Exception:
-            return order_id, ""
-    return order_id, ""
-
-
-def fetch_concurrently(items, worker_fn, store_info, rate_limiter, status_placeholder, label, max_workers=4):
+    escaped_query = json.dumps(inner_query)  # escapa comillas/saltos de línea para incrustarla en la mutation
+    mutation = f"""
+    mutation {{
+      bulkOperationRunQuery(query: {escaped_query}) {{
+        bulkOperation {{ id status }}
+        userErrors {{ field message }}
+      }}
+    }}
     """
-    Ejecuta worker_fn(item, store_info, rate_limiter) en paralelo para una lista
-    de items, mostrando progreso en vivo. worker_fn debe devolver (clave, valor).
-    Devuelve un diccionario {clave: valor}.
+    resp = requests.post(graphql_url(store_info), headers=graphql_headers(store_info), json={"query": mutation})
+    resp.raise_for_status()
+    data = resp.json()
+
+    if "errors" in data:
+        raise RuntimeError(f"Error GraphQL: {data['errors']}")
+
+    result = data["data"]["bulkOperationRunQuery"]
+    if result["userErrors"]:
+        raise RuntimeError(f"Error iniciando bulk operation: {result['userErrors']}")
+
+    return result["bulkOperation"]["id"]
+
+
+def wait_for_bulk_operation(store_info, status_placeholder, marca):
+    """Consulta el estado del bulk operation cada 2 seg hasta que termine."""
+    check_query = """
+    {
+      currentBulkOperation {
+        id
+        status
+        errorCode
+        objectCount
+        url
+      }
+    }
     """
-    results = {}
-    total = len(items)
-    if total == 0:
-        return results
+    while True:
+        resp = requests.post(graphql_url(store_info), headers=graphql_headers(store_info), json={"query": check_query})
+        resp.raise_for_status()
+        op = resp.json()["data"]["currentBulkOperation"]
 
-    completado = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(worker_fn, item, store_info, rate_limiter) for item in items]
-        for future in concurrent.futures.as_completed(futures):
-            clave, valor = future.result()
-            results[clave] = valor
-            completado += 1
-            if completado % 5 == 0 or completado == total:
-                status_placeholder.text(f"{label}: {completado}/{total}")
+        if op is None:
+            time_lib.sleep(2)
+            continue
 
-    return results
+        status_placeholder.text(
+            f"{marca}: exportando pedidos... estado: {op['status']} ({op.get('objectCount', 0)} objetos)"
+        )
+
+        if op["status"] == "COMPLETED":
+            return op.get("url")
+        if op["status"] in ("FAILED", "CANCELED"):
+            raise RuntimeError(f"Bulk operation terminó en estado {op['status']} ({op.get('errorCode')})")
+
+        time_lib.sleep(2)
 
 
-def process_orders(orders, marca, product_tags_cache, payment_ids_cache):
-    """Aplana el JSON y arma cada fila usando los caches ya resueltos (sin llamadas a la API)."""
+def download_jsonl(download_url):
+    """Descarga el archivo JSONL resultante y lo parsea línea por línea."""
+    if not download_url:
+        return []
+    resp = requests.get(download_url)
+    resp.raise_for_status()
+    rows = []
+    for line in resp.text.splitlines():
+        line = line.strip()
+        if line:
+            rows.append(json.loads(line))
+    return rows
+
+
+def build_orders_from_bulk(rows):
+    """
+    El JSONL de Shopify viene 'aplanado': cada pedido es una fila, y cada
+    línea de producto es OTRA fila con '__parentId' apuntando al pedido.
+    Acá los reagrupamos.
+    """
+    orders = {}
+    line_items_by_order = {}
+
+    for row in rows:
+        parent_id = row.get("__parentId")
+        node_id = row.get("id", "")
+
+        if parent_id is None:
+            orders[node_id] = row
+        elif "LineItem" in node_id:
+            line_items_by_order.setdefault(parent_id, []).append(row)
+
+    for order_id, order in orders.items():
+        order["_line_items"] = line_items_by_order.get(order_id, [])
+
+    return list(orders.values())
+
+
+def process_orders_bulk(orders, marca):
+    """Arma las filas finales del reporte a partir de los pedidos ya reagrupados."""
     rows = []
     for order in orders:
-        created_at = datetime.fromisoformat(order["created_at"].replace("Z", "+00:00"))
-        shipping_address = order.get("shipping_address", {})
-        provincia = shipping_address.get("province", "") if shipping_address else ""
-        
-        customer = order.get("customer", {})
-        nombre_cliente = customer.get("first_name", "") or ""
-        apellido_cliente = customer.get("last_name", "") or ""
-        nombre_apellido = f"{nombre_cliente} {apellido_cliente}".strip()
-        email = order.get("email", "") or order.get("contact_email", "")
-        
-        gateways_raw = ", ".join(order.get("payment_gateway_names", [])).lower()
-        if "mercado" in gateways_raw or "mercadopago" in gateways_raw:
+        created_at = datetime.fromisoformat(order["createdAt"].replace("Z", "+00:00"))
+        shipping_address = order.get("shippingAddress") or {}
+        provincia = shipping_address.get("province", "") or ""
+
+        customer = order.get("customer") or {}
+        nombre_apellido = f"{(customer.get('firstName') or '')} {(customer.get('lastName') or '')}".strip()
+        email = order.get("email", "") or ""
+
+        gateways = order.get("paymentGatewayNames") or []
+        gateways_raw = ", ".join(gateways).lower()
+        if "mercado" in gateways_raw:
             metodo_pago = "Mercado Pago"
         elif "mobbex" in gateways_raw:
             metodo_pago = "Mobbex"
         elif "reversso" in gateways_raw:
             metodo_pago = "Reversso"
         else:
-            metodo_pago = ", ".join(order.get("payment_gateway_names", [])).title()
-        
-        # --- Lógica de estados nuevos ---
-        estado_cancelacion = "Cancelado" if order.get("cancelled_at") else "Activo"
-        
-        fulfillment_status = order.get("fulfillment_status")
-        if fulfillment_status == "fulfilled":
-            estado_preparacion = "Preparado"
-        elif fulfillment_status == "partial":
-            estado_preparacion = "Preparación Parcial"
-        elif fulfillment_status is None:
-            estado_preparacion = "No requiere preparación" 
-        else:
-            estado_preparacion = fulfillment_status.replace("_", " ").title()
+            metodo_pago = ", ".join(gateways).title()
 
-        id_pago = payment_ids_cache.get(order.get("id"), "")
-        
-        for line in order.get("line_items", []):
-            product_id = line.get("product_id")
-            tags_producto = product_tags_cache.get(product_id, "")
-            
+        estado_cancelacion = "Cancelado" if order.get("cancelledAt") else "Activo"
+
+        fulfillment_status = (order.get("displayFulfillmentStatus") or "").upper()
+        mapa_prep = {
+            "FULFILLED": "Preparado",
+            "PARTIALLY_FULFILLED": "Preparación Parcial",
+            "UNFULFILLED": "No requiere preparación",
+        }
+        estado_preparacion = mapa_prep.get(fulfillment_status, fulfillment_status.replace("_", " ").title())
+
+        # --- ID de pago: viene directo en 'transactions', sin llamadas extra ---
+        id_pago = ""
+        transacciones = order.get("transactions") or []
+        candidatas = [
+            t for t in transacciones
+            if (t.get("status") or "").upper() == "SUCCESS" and (t.get("kind") or "").upper() in ("SALE", "CAPTURE")
+        ]
+        if not candidatas:
+            candidatas = transacciones
+        for t in candidatas:
+            id_pago = t.get("paymentId") or t.get("authorizationCode") or ""
+            if id_pago:
+                break
+
+        shipping_line = order.get("shippingLine") or {}
+        total_price = (order.get("totalPriceSet") or {}).get("shopMoney", {}).get("amount", 0) or 0
+
+        for line in order.get("_line_items", []):
+            producto = line.get("product") or {}
+            tags_producto = ", ".join(producto.get("tags") or [])
+
+            precio_raw = (line.get("originalUnitPriceSet") or {}).get("shopMoney", {}).get("amount", 0) or 0
+            try:
+                precio = float(precio_raw)
+            except (TypeError, ValueError):
+                precio = 0.0
+
             row = {
                 "NOMBRE Y APELLIDO": nombre_apellido,
                 "EMAIL": email,
@@ -251,23 +208,67 @@ def process_orders(orders, marca, product_tags_cache, payment_ids_cache):
                 "FECHA": created_at.strftime("%d/%m/%Y"),
                 "HORA": created_at.strftime("%H:%M:%S"),
                 "PROVINCIA": provincia,
-                "SKU": line.get("sku", ""),
+                "SKU": line.get("sku") or "",
                 "TAGS PRODUCTO": tags_producto,
-                "MODELO / COLOR": line.get("variant_title", ""),
-                "DESCRIPCION": line.get("title", ""),
+                "MODELO / COLOR": line.get("variantTitle") or "",
+                "DESCRIPCION": line.get("title") or "",
                 "CANTIDAD": line.get("quantity", 0),
-                "PRECIO UNITARIO": float(line.get("price", 0.00)),
-                "TOTAL PEDIDO": float(order.get("total_price", 0.00)),
-                "ESTADO DEL PAGO": order.get("financial_status", ""),
-                "ESTADO": order.get("fulfillment_status", "unfulfilled") or "unfulfilled",
-                "ENVIO": order.get("shipping_lines", [{}])[0].get("title", "") if order.get("shipping_lines") else "",
+                "PRECIO UNITARIO": precio,
+                "TOTAL PEDIDO": float(total_price),
+                "ESTADO DEL PAGO": order.get("displayFinancialStatus", ""),
+                "ESTADO": fulfillment_status or "UNFULFILLED",
+                "ENVIO": shipping_line.get("title", ""),
                 "METODO DE PAGO": metodo_pago,
                 "ESTADO CANCELACION": estado_cancelacion,
                 "ESTADO PREPARACION": estado_preparacion,
-                "ID DE PAGO": id_pago
+                "ID DE PAGO": id_pago,
             }
             rows.append(row)
     return rows
+
+
+def build_inner_query(start_str, end_str):
+    return f"""
+    {{
+      orders(query: "created_at:>='{start_str}' AND created_at:<='{end_str}' AND status:any") {{
+        edges {{
+          node {{
+            id
+            name
+            createdAt
+            cancelledAt
+            email
+            displayFinancialStatus
+            displayFulfillmentStatus
+            paymentGatewayNames
+            customer {{ firstName lastName }}
+            shippingAddress {{ province }}
+            shippingLine {{ title }}
+            totalPriceSet {{ shopMoney {{ amount }} }}
+            transactions {{
+              kind
+              status
+              paymentId
+              authorizationCode
+            }}
+            lineItems {{
+              edges {{
+                node {{
+                  sku
+                  title
+                  variantTitle
+                  quantity
+                  originalUnitPriceSet {{ shopMoney {{ amount }} }}
+                  product {{ tags }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+
 
 # --- Interfaz de Usuario ---
 st.title("Consolidador Shopify")
@@ -280,9 +281,7 @@ with col2:
     available_brands = list(STORES.keys())
     selected_brands = st.multiselect("Marcas", available_brands, default=available_brands)
 
-incluir_pago = st.checkbox("Incluir ID de pago (agrega una llamada extra por pedido, más lento)", value=True)
-
-st.write("") 
+st.write("")
 
 if st.button("Generar Reporte", type="primary"):
     if len(date_range) != 2:
@@ -292,57 +291,49 @@ if st.button("Generar Reporte", type="primary"):
     else:
         start_date, end_date = date_range
         all_data = []
-        
+
+        start_str = datetime.combine(start_date, datetime.min.time()).isoformat() + "-03:00"
+        end_str = datetime.combine(end_date, datetime.max.time()).isoformat() + "-03:00"
+
         start_time = time_lib.time()
         progress_bar = st.progress(0)
         status_placeholder = st.empty()
-        
-        for i, marca in enumerate(selected_brands):
-            store_info = STORES[marca]
-            rate_limiter = RateLimiter()
 
-            status_placeholder.text(f"{marca}: descargando pedidos...")
-            raw_orders = fetch_orders(store_info, start_date, end_date, rate_limiter)
+        try:
+            for i, marca in enumerate(selected_brands):
+                store_info = STORES[marca]
 
-            # IDs de producto únicos para no pedir tags repetidos
-            product_ids = list({
-                line.get("product_id")
-                for order in raw_orders
-                for line in order.get("line_items", [])
-                if line.get("product_id")
-            })
-            product_tags_cache = fetch_concurrently(
-                product_ids, get_product_tags, store_info, rate_limiter,
-                status_placeholder, f"{marca}: obteniendo tags de productos"
-            )
+                status_placeholder.text(f"{marca}: iniciando exportación...")
+                inner_query = build_inner_query(start_str, end_str)
+                run_bulk_query(store_info, inner_query)
 
-            payment_ids_cache = {}
-            if incluir_pago:
-                order_ids = [o.get("id") for o in raw_orders if o.get("id")]
-                payment_ids_cache = fetch_concurrently(
-                    order_ids, get_payment_id, store_info, rate_limiter,
-                    status_placeholder, f"{marca}: obteniendo ID de pago"
-                )
+                download_url = wait_for_bulk_operation(store_info, status_placeholder, marca)
+                raw_rows = download_jsonl(download_url)
 
-            processed_rows = process_orders(raw_orders, marca, product_tags_cache, payment_ids_cache)
-            all_data.extend(processed_rows)
-            progress_bar.progress((i + 1) / len(selected_brands))
-            
+                orders = build_orders_from_bulk(raw_rows)
+                processed_rows = process_orders_bulk(orders, marca)
+                all_data.extend(processed_rows)
+
+                progress_bar.progress((i + 1) / len(selected_brands))
+        except RuntimeError as e:
+            st.error(f"Error durante la exportación: {e}")
+            all_data = []
+
         progress_bar.empty()
         status_placeholder.empty()
-        
+
         if all_data:
             df = pd.DataFrame(all_data)
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Ventas')
-            
+
             elapsed = time_lib.time() - start_time
-            st.success(f"Reporte procesado en {elapsed/60:.1f} minutos.")
-            
+            st.success(f"Reporte procesado en {elapsed:.0f} segundos.")
+
             with st.expander("Ver vista previa"):
                 st.dataframe(df.head(50), use_container_width=True)
-            
+
             st.download_button(
                 label="Descargar Archivo",
                 data=output.getvalue(),
