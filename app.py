@@ -131,7 +131,9 @@ def build_orders_from_bulk(rows):
 
         if parent_id is None:
             orders[node_id] = row
-        elif "LineItem" in node_id:
+        else:
+            # lineItems es la única conexión anidada en esta consulta,
+            # así que cualquier fila con __parentId es una línea de producto.
             line_items_by_order.setdefault(parent_id, []).append(row)
 
     for order_id, order in orders.items():
