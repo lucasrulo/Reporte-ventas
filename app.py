@@ -641,6 +641,8 @@ class MeliReporte:
                 "COSTO ENVIO VENDEDOR": (env.get("costo_vendedor", 0.0)
                                          if primera and shipping_id and shipping_id not in envio_ya_contado else 0.0),
                 "ANULACIONES Y REEMBOLSOS": reembolso if primera else 0.0,
+                "_item_id": str(item.get("id") or ""),
+                "_unit_price": num(oi.get("unit_price")),
             })
             if primera and shipping_id:
                 envio_ya_contado.add(shipping_id)
@@ -666,6 +668,150 @@ def generar_meli(marca, start_date, end_date, status_placeholder):
         sid = (o.get("shipping") or {}).get("id")
         filas.extend(rep.a_filas(o, envios.get(sid, {}), contados))
     return ordenes, filas
+
+
+# ---------- Devoluciones ----------
+# Flujo: reclamos (claims) del vendedor -> los que tienen devolución -> orden original.
+ESTADO_DEVOLUCION = {
+    "pending": "Pendiente",
+    "label_generated": "Devolución preparada",
+    "opened": "Abierta",
+    "ready_to_ship": "Devolución preparada",
+    "shipped": "En camino al vendedor",
+    "delivered": "Recibida",
+    "not_delivered": "No entregada",
+    "cancelled": "Cancelada",
+    "failed": "Fallida",
+    "expired": "Vencida",
+    "closed": "Cerrada",
+}
+ESTADO_DINERO = {"retained": "Retenido", "refunded": "Reembolsado al comprador", "available": "Liberado al vendedor"}
+DESTINO_DEV = {"seller_address": "Vendedor", "warehouse": "Depósito MeLi"}
+
+
+def _fecha_corta(v):
+    try:
+        return pd.Timestamp(v).tz_convert(ZONA_AR).strftime("%d/%m/%Y") if v else ""
+    except Exception:
+        return str(v or "")[:10]
+
+
+def estado_devolucion(dev):
+    """'Devolución preparada' = etiqueta generada / lista para que el comprador la despache."""
+    envio = dev.get("shipping") or (dev.get("shipments") or [{}])[0] or {}
+    env_st = (envio.get("status") or "").lower()
+    st_ = (dev.get("status") or "").lower()
+    if st_ in ("opened", "pending", "label_generated") and env_st in ("ready_to_ship", "pending", ""):
+        return "Devolución preparada" if env_st == "ready_to_ship" or st_ == "label_generated" else "Pendiente"
+    if env_st == "shipped" and st_ not in ("delivered", "closed", "cancelled"):
+        return "En camino al vendedor"
+    return ESTADO_DEVOLUCION.get(st_, st_ or "S/D")
+
+
+class MeliDevoluciones(MeliReporte):
+    def buscar_reclamos(self, desde, hasta, status_placeholder, resource_id=None):
+        reclamos, offset = [], 0
+        while True:
+            params = {"limit": 50, "offset": offset, "sort": "date_created:asc"}
+            if resource_id:
+                params["resource_id"] = resource_id
+            else:
+                params["range"] = (f"date_created:after:{desde.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')},"
+                                   f"before:{hasta.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')}")
+            r = self.get("/post-purchase/v1/claims/search", params)
+            if r is None or r.status_code != 200:
+                raise RuntimeError(f"/claims/search HTTP {getattr(r, 'status_code', '?')} {getattr(r, 'text', '')[:200]}")
+            d = r.json()
+            res = d.get("data") or d.get("results") or []
+            reclamos.extend(res)
+            offset += len(res)
+            status_placeholder.text(f"{self.marca}: {len(reclamos)} reclamos revisados...")
+            if not res or offset >= (d.get("paging") or {}).get("total", 0):
+                break
+        return reclamos
+
+    def devolucion(self, claim_id):
+        r = self.get(f"/post-purchase/v2/claims/{claim_id}/returns")
+        if r is None or r.status_code != 200:
+            return None
+        d = r.json()
+        return d if d else None
+
+    def ordenes_de(self, resource, resource_id):
+        """El reclamo puede estar sobre una orden o sobre un pack (carrito)."""
+        if not resource_id:
+            return []
+        r = self.get(f"/orders/{resource_id}")
+        if r is not None and r.status_code == 200:
+            return [r.json()]
+        p = self.get(f"/packs/{resource_id}")
+        if p is not None and p.status_code == 200:
+            out = []
+            for o in p.json().get("orders") or []:
+                ro = self.get(f"/orders/{o.get('id')}")
+                if ro is not None and ro.status_code == 200:
+                    out.append(ro.json())
+            return out
+        return []
+
+    def filas_reclamo(self, claim):
+        rel = claim.get("related_entities")
+        if rel is not None and "return" not in rel and claim.get("type") != "return":
+            return []
+        dev = self.devolucion(claim["id"])
+        if not dev:
+            return []
+        ordenes = self.ordenes_de(claim.get("resource"), claim.get("resource_id") or dev.get("resource_id"))
+        envio_dev = dev.get("shipping") or (dev.get("shipments") or [{}])[0] or {}
+        # Cantidades devueltas por ítem (si MeLi las informa; si no, se toma la cantidad vendida)
+        cant_dev = {}
+        for x in dev.get("orders") or []:
+            q = x.get("return_quantity") or x.get("total_quantity")
+            if x.get("item_id") and q:
+                cant_dev[str(x["item_id"])] = int(q)
+
+        filas, contados = [], set()
+        for o in ordenes:
+            env = self.envio((o.get("shipping") or {}).get("id"))
+            for f in self.a_filas(o, env, contados):
+                if cant_dev and f["_item_id"] not in cant_dev:
+                    continue  # devolución parcial: ese ítem no se devolvió
+                if f["_item_id"] in cant_dev:
+                    f["CANTIDAD"] = cant_dev[f["_item_id"]]
+                    f["VALOR ARTICULO"] = f["_unit_price"] * f["CANTIDAD"]
+                f.update({
+                    "ID RECLAMO": str(claim["id"]),
+                    "FECHA RECLAMO": _fecha_corta(claim.get("date_created")),
+                    "ESTADO DEVOLUCION": estado_devolucion(dev),
+                    "ESTADO DINERO": ESTADO_DINERO.get(dev.get("status_money"), dev.get("status_money") or ""),
+                    "DESTINO DEVOLUCION": DESTINO_DEV.get((envio_dev.get("destination") or {}).get("name"), ""),
+                    "TRACKING DEVOLUCION": str(envio_dev.get("tracking_number") or ""),
+                    "MOTIVO": claim.get("reason_id", ""),
+                    "FECHA CIERRE": _fecha_corta(dev.get("date_closed")),
+                })
+                filas.append(f)
+        return filas
+
+
+def generar_devoluciones(marca, start_date, end_date, status_placeholder, resource_id=None):
+    rep = MeliDevoluciones(marca, token_vigente(marca))
+    desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
+    hasta = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=ZONA_AR)
+    reclamos = rep.buscar_reclamos(desde, hasta, status_placeholder, resource_id)
+    status_placeholder.text(f"{marca}: revisando {len(reclamos)} reclamos con posible devolución...")
+    filas = []
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for res in ex.map(rep.filas_reclamo, reclamos):
+            filas.extend(res)
+    return reclamos, filas
+
+
+COLUMNAS_DEVOLUCION = [
+    "MARCA", "PACK ID", "ORDEN MELI", "ORDER ID MP (ID PAGO)", "ID RECLAMO", "FECHA", "FECHA RECLAMO",
+    "ESTADO", "ESTADO DEL PEDIDO", "ESTADO DEVOLUCION", "ESTADO DINERO", "DESTINO DEVOLUCION",
+    "TRACKING DEVOLUCION", "MOTIVO", "SKU", "DESCRIPCION", "CANTIDAD", "VALOR ARTICULO",
+    "IMPORTE DEL ENVIO", "COSTO ENVIO VENDEDOR", "ANULACIONES Y REEMBOLSOS", "FECHA CIERRE",
+]
 
 
 def descargar_excel(df, nombre_hoja, file_name, start_time):
@@ -733,12 +879,46 @@ if canal == "MercadoLibre":
                                                "redirect_uri": MELI_REDIRECT, "state": m})
             c2.link_button("Reconectar" if info else "Conectar", url)
 
+tipo_meli = "Ventas"
+if canal == "MercadoLibre":
+    tipo_meli = st.radio("Reporte", ["Ventas", "Devoluciones"], horizontal=True)
+    if tipo_meli == "Devoluciones":
+        st.caption("Trae los reclamos con devolución creados en el rango de fechas, "
+                   "con los datos de la venta original.")
+
 col1, col2 = st.columns(2)
 with col1:
     date_range = st.date_input("Rango de Fechas", [])
 with col2:
     available_brands = list(STORES.keys()) if canal == "Shopify" else MELI_CUENTAS
     selected_brands = st.multiselect("Marcas", available_brands, default=available_brands, key=f"marcas_{canal}")
+
+if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
+    with st.expander("🔎 Buscar la devolución de un pack / orden puntual"):
+        b1, b2 = st.columns([2, 1])
+        id_buscar = b1.text_input("Pack ID u orden de MeLi", key="id_dev")
+        marca_buscar = b2.selectbox("Marca", MELI_CUENTAS, key="marca_dev")
+        if st.button("Buscar") and id_buscar.strip():
+            ph = st.empty()
+            hoy = datetime.now(ZONA_AR).date()
+            try:
+                encontrados, filas_b = [], []
+                for rid in dict.fromkeys([id_buscar.strip()]):
+                    recl, filas_x = generar_devoluciones(marca_buscar, hoy, hoy, ph, resource_id=rid)
+                    encontrados += recl
+                    filas_b += filas_x
+                ph.empty()
+                if filas_b:
+                    df_b = pd.DataFrame(filas_b)
+                    st.dataframe(df_b[[c for c in COLUMNAS_DEVOLUCION if c in df_b.columns]], use_container_width=True)
+                elif encontrados:
+                    st.info(f"Encontré {len(encontrados)} reclamo(s) pero sin devolución asociada.")
+                    st.json(encontrados[:3])
+                else:
+                    st.info("No hay reclamos para ese ID en esa marca.")
+            except Exception as e:
+                ph.empty()
+                st.error(str(e))
 
 st.write("")
 
@@ -790,9 +970,13 @@ if st.button("Generar Reporte", type="primary"):
             for i, marca in enumerate(selected_brands):
                 try:
                     status_placeholder.text(f"{marca}: verificando token...")
-                    ordenes, filas = generar_meli(marca, start_date, end_date, status_placeholder)
+                    if tipo_meli == "Ventas":
+                        ordenes, filas = generar_meli(marca, start_date, end_date, status_placeholder)
+                        st.caption(f"🔍 {marca}: {len(ordenes)} órdenes, {len(filas)} filas generadas.")
+                    else:
+                        reclamos, filas = generar_devoluciones(marca, start_date, end_date, status_placeholder)
+                        st.caption(f"🔍 {marca}: {len(reclamos)} reclamos revisados, {len(filas)} filas de devolución.")
                     all_data.extend(filas)
-                    st.caption(f"🔍 {marca}: {len(ordenes)} órdenes, {len(filas)} filas generadas.")
                 except Exception as e:
                     st.error(f"{marca}: error durante la exportación — {e}")
 
@@ -805,7 +989,13 @@ if st.button("Generar Reporte", type="primary"):
             df = pd.DataFrame(all_data)
             if canal == "Shopify":
                 descargar_excel(df, "Ventas", f"Reporte_{start_date}_al_{end_date}.xlsx", start_time)
-            else:
+            elif tipo_meli == "Ventas":
+                df = df.drop(columns=["_item_id", "_unit_price"], errors="ignore")
                 descargar_excel(df, "Ventas MeLi", f"Reporte_MeLi_{start_date}_al_{end_date}.xlsx", start_time)
+            else:
+                df = df[[c for c in COLUMNAS_DEVOLUCION if c in df.columns]]
+                descargar_excel(df, "Devoluciones MeLi",
+                                f"Devoluciones_MeLi_{start_date}_al_{end_date}.xlsx", start_time)
         else:
-            st.info("No se registraron ventas en el período seleccionado.")
+            st.info("No se registraron " + ("devoluciones" if canal == "MercadoLibre" and tipo_meli == "Devoluciones"
+                                            else "ventas") + " en el período seleccionado.")
