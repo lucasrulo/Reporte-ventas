@@ -708,6 +708,15 @@ def estado_devolucion(dev):
     return ESTADO_DEVOLUCION.get(st_, st_ or "S/D")
 
 
+PREFIJO_MOTIVO = {"PNR": "Producto no recibido", "PDD": "Producto defectuoso o distinto al publicado",
+                  "CS": "Compra cancelada"}
+
+
+@st.cache_resource
+def _cache_motivos():
+    return {}
+
+
 class MeliDevoluciones(MeliReporte):
     def buscar_reclamos(self, desde, hasta, status_placeholder, resource_id=None):
         # MeLi exige al menos un filtro "real": filtramos por la cuenta vendedora (respondent).
@@ -757,6 +766,26 @@ class MeliDevoluciones(MeliReporte):
                 return [c for c in reclamos
                         if (f := fecha_reclamo(c)) is None or desde <= f <= hasta]
         raise RuntimeError(f"/claims/search {ultimo_error}")
+
+    def motivo(self, reason_id):
+        """Traduce el código (ej. PDD9939) al texto del motivo. Se cachea por servidor."""
+        if not reason_id:
+            return ""
+        cache = _cache_motivos()
+        if reason_id in cache:
+            return cache[reason_id]
+        texto = ""
+        for path in (f"/marketplace/v2/claims/reasons/{reason_id}", f"/post-purchase/v1/claims/reasons/{reason_id}"):
+            r = self.get(path)
+            if r is not None and r.status_code == 200:
+                d = r.json()
+                texto = d.get("detail") or d.get("name") or ""
+                if texto:
+                    break
+        if not texto:
+            texto = PREFIJO_MOTIVO.get(str(reason_id)[:3], "")
+        cache[reason_id] = texto
+        return texto
 
     def devolucion(self, claim_id):
         r = self.get(f"/post-purchase/v2/claims/{claim_id}/returns")
@@ -814,7 +843,8 @@ class MeliDevoluciones(MeliReporte):
                     "ESTADO DINERO": ESTADO_DINERO.get(dev.get("status_money"), dev.get("status_money") or ""),
                     "DESTINO DEVOLUCION": DESTINO_DEV.get((envio_dev.get("destination") or {}).get("name"), ""),
                     "TRACKING DEVOLUCION": str(envio_dev.get("tracking_number") or ""),
-                    "MOTIVO": claim.get("reason_id", ""),
+                    "MOTIVO": self.motivo(claim.get("reason_id")),
+                    "CODIGO MOTIVO": claim.get("reason_id", ""),
                     "FECHA CIERRE": _fecha_corta(dev.get("date_closed")),
                 })
                 filas.append(f)
@@ -837,7 +867,7 @@ def generar_devoluciones(marca, start_date, end_date, status_placeholder, resour
 COLUMNAS_DEVOLUCION = [
     "MARCA", "PACK ID", "ORDEN MELI", "ORDER ID MP (ID PAGO)", "ID RECLAMO", "FECHA", "FECHA RECLAMO",
     "ESTADO", "ESTADO DEL PEDIDO", "ESTADO DEVOLUCION", "ESTADO DINERO", "DESTINO DEVOLUCION",
-    "TRACKING DEVOLUCION", "MOTIVO", "SKU", "DESCRIPCION", "CANTIDAD", "VALOR ARTICULO",
+    "TRACKING DEVOLUCION", "MOTIVO", "CODIGO MOTIVO", "SKU", "DESCRIPCION", "CANTIDAD", "VALOR ARTICULO",
     "IMPORTE DEL ENVIO", "COSTO ENVIO VENDEDOR", "ANULACIONES Y REEMBOLSOS", "FECHA CIERRE",
 ]
 
