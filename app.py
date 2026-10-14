@@ -7,7 +7,7 @@ import io
 import json
 
 # 1. Configuración Minimalista de la página
-st.set_page_config(page_title="Descarga ventas Shopify", layout="centered")
+st.set_page_config(page_title="Descarga ventas Shopify + MeLi", layout="centered")
 
 hide_st_style = """
             <style>
@@ -21,9 +21,8 @@ st.markdown(hide_st_style, unsafe_allow_html=True)
 
 try:
     STORES = st.secrets["stores"]
-except KeyError:
-    st.error("Credenciales no configuradas en st.secrets.")
-    st.stop()
+except Exception:
+    STORES = {}
 
 API_VERSION = "2024-01"
 
@@ -327,81 +326,486 @@ def build_inner_query(start_str, end_str):
     """
 
 
+# ==============================================================================
+# 🟡 MERCADOLIBRE (100% autónomo: no depende de ningún otro repo)
+# ==============================================================================
+# - Usa una app de MeLi PROPIA para este reporte (distinta de la del dashboard),
+#   así sus tokens no se cruzan con los del pipeline.
+# - El refresh_token de MeLi es de UN SOLO USO: cada renovación devuelve uno nuevo.
+#   Por eso se guarda CIFRADO (Fernet) en la rama 'meli-tokens' de ESTE repo.
+#   Streamlit solo despliega 'main', así que escribir en esa rama no reinicia la app.
+import base64
+import threading
+from datetime import timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlencode
+
+from cryptography.fernet import Fernet, InvalidToken
+
+MELI_API = "https://api.mercadolibre.com"
+MELI_AUTH = "https://auth.mercadolibre.com.ar/authorization"
+ZONA_AR = timezone(timedelta(hours=-3))
+
+try:
+    MELI_CFG = dict(st.secrets.get("meli", {}))
+except Exception:
+    MELI_CFG = {}
+
+MELI_APP_ID = str(MELI_CFG.get("app_id", ""))
+MELI_CLIENT_SECRET = MELI_CFG.get("client_secret", "")
+MELI_REDIRECT = MELI_CFG.get("redirect_uri", "https://reporte-ventas-distrinando.streamlit.app")
+MELI_FERNET_KEY = MELI_CFG.get("fernet_key", "")
+GH_TOKEN = MELI_CFG.get("github_token", "")
+GH_REPO = MELI_CFG.get("repo", "lucasrulo/reporte-ventas")
+GH_BRANCH = MELI_CFG.get("branch", "meli-tokens")
+GH_FILE = "meli_tokens.enc"
+MELI_CUENTAS = list(MELI_CFG.get("cuentas", ["Reebok", "Crocs", "Kappa", "Columbia"]))
+
+MELI_FALTANTES = [k for k in ("app_id", "client_secret", "fernet_key", "github_token") if not MELI_CFG.get(k)]
+
+
+# ---------- Almacén de tokens (memoria + archivo cifrado en GitHub) ----------
+@st.cache_resource
+def _estado_tokens():
+    # Compartido por todas las sesiones del mismo servidor
+    return {"lock": threading.Lock(), "tokens": None, "sha": None}
+
+
+def _gh_headers():
+    return {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
+
+
+def _gh_url():
+    return f"https://api.github.com/repos/{GH_REPO}/contents/{GH_FILE}"
+
+
+def _asegurar_rama():
+    r = requests.get(f"https://api.github.com/repos/{GH_REPO}/git/ref/heads/{GH_BRANCH}", headers=_gh_headers(), timeout=20)
+    if r.status_code == 200:
+        return
+    repo = requests.get(f"https://api.github.com/repos/{GH_REPO}", headers=_gh_headers(), timeout=20)
+    repo.raise_for_status()
+    base = repo.json()["default_branch"]
+    ref = requests.get(f"https://api.github.com/repos/{GH_REPO}/git/ref/heads/{base}", headers=_gh_headers(), timeout=20)
+    ref.raise_for_status()
+    c = requests.post(f"https://api.github.com/repos/{GH_REPO}/git/refs", headers=_gh_headers(), timeout=20,
+                      json={"ref": f"refs/heads/{GH_BRANCH}", "sha": ref.json()["object"]["sha"]})
+    if c.status_code not in (201, 422):  # 422 = ya existe
+        raise RuntimeError(f"No pude crear la rama {GH_BRANCH}: HTTP {c.status_code} {c.text[:200]}")
+
+
+def _cargar_tokens(estado):
+    """Lee el archivo cifrado desde GitHub (solo la primera vez por servidor)."""
+    if estado["tokens"] is not None:
+        return estado["tokens"]
+    r = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=20)
+    if r.status_code == 404:
+        estado["tokens"], estado["sha"] = {}, None
+        return estado["tokens"]
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub HTTP {r.status_code} leyendo tokens: {r.text[:200]}")
+    d = r.json()
+    try:
+        plano = Fernet(MELI_FERNET_KEY.encode()).decrypt(base64.b64decode(d["content"]))
+    except InvalidToken:
+        raise RuntimeError("No pude descifrar los tokens: cambió la fernet_key. Volvé a conectar las cuentas.")
+    estado["tokens"], estado["sha"] = json.loads(plano), d["sha"]
+    return estado["tokens"]
+
+
+def _guardar_tokens(estado):
+    _asegurar_rama()
+    cifrado = Fernet(MELI_FERNET_KEY.encode()).encrypt(json.dumps(estado["tokens"]).encode())
+    body = {"message": "tokens meli", "branch": GH_BRANCH, "content": base64.b64encode(cifrado).decode()}
+    if estado["sha"]:
+        body["sha"] = estado["sha"]
+    r = requests.put(_gh_url(), headers=_gh_headers(), json=body, timeout=20)
+    if r.status_code == 409 or (r.status_code == 422 and "sha" in r.text):
+        # sha desactualizado: tomamos el actual y reintentamos una vez
+        actual = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=20)
+        if actual.status_code == 200:
+            body["sha"] = actual.json()["sha"]
+            r = requests.put(_gh_url(), headers=_gh_headers(), json=body, timeout=20)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"No pude guardar los tokens en GitHub: HTTP {r.status_code} {r.text[:200]}")
+    estado["sha"] = r.json()["content"]["sha"]
+
+
+def _pedir_token(data):
+    r = requests.post(f"{MELI_API}/oauth/token", timeout=30, data=data,
+                      headers={"accept": "application/json", "content-type": "application/x-www-form-urlencoded"})
+    if r.status_code != 200:
+        raise RuntimeError(f"MeLi rechazó el pedido de token (HTTP {r.status_code}): {r.text[:200]}")
+    d = r.json()
+    if "refresh_token" not in d:
+        raise RuntimeError("MeLi no devolvió refresh_token: en la app de MeLi activá 'offline_access' / Refresh Token.")
+    return d
+
+
+def conectar_cuenta(marca, code):
+    """Canjea el code del login de MeLi y guarda los tokens de esa marca."""
+    d = _pedir_token({"grant_type": "authorization_code", "client_id": MELI_APP_ID,
+                      "client_secret": MELI_CLIENT_SECRET, "code": code, "redirect_uri": MELI_REDIRECT})
+    nick = ""
+    try:
+        me = requests.get(f"{MELI_API}/users/me", headers={"Authorization": f"Bearer {d['access_token']}"}, timeout=20)
+        nick = me.json().get("nickname", "")
+    except Exception:
+        pass
+    estado = _estado_tokens()
+    with estado["lock"]:
+        tokens = _cargar_tokens(estado)
+        tokens[marca] = {"access_token": d["access_token"], "refresh_token": d["refresh_token"],
+                         "expires_at": int(time_lib.time()) + int(d.get("expires_in", 21600)),
+                         "user_id": d["user_id"], "nickname": nick}
+        _guardar_tokens(estado)
+    return nick
+
+
+def token_vigente(marca, forzar=False):
+    """Devuelve un access_token válido; renueva solo si le quedan < 30 min."""
+    estado = _estado_tokens()
+    with estado["lock"]:
+        tokens = _cargar_tokens(estado)
+        tok = tokens.get(marca)
+        if not tok:
+            raise RuntimeError("Cuenta no conectada. Conectala en '⚙️ Cuentas de MercadoLibre'.")
+        if not forzar and tok["expires_at"] - time_lib.time() > 1800:
+            return tok
+        d = _pedir_token({"grant_type": "refresh_token", "client_id": MELI_APP_ID,
+                          "client_secret": MELI_CLIENT_SECRET, "refresh_token": tok["refresh_token"]})
+        tokens[marca] = {**tok, "access_token": d["access_token"],
+                         "refresh_token": d.get("refresh_token", tok["refresh_token"]),
+                         "expires_at": int(time_lib.time()) + int(d.get("expires_in", 21600))}
+        # El refresh viejo ya no sirve: se guarda el nuevo inmediatamente
+        _guardar_tokens(estado)
+        return tokens[marca]
+
+
+# ---------- Reporte ----------
+ESTADO_ORDEN_MELI = {
+    "paid": "Pagada",
+    "confirmed": "Confirmada",
+    "payment_required": "Pago pendiente",
+    "payment_in_process": "Pago en proceso",
+    "partially_paid": "Pago parcial",
+    "partially_refunded": "Reembolso parcial",
+    "pending_cancel": "Cancelación pendiente",
+    "cancelled": "Cancelada",
+    "invalid": "Inválida",
+}
+
+FALLA_ENTREGA = {"receiver_absent", "not_visited", "delivery_failed", "bad_address", "not_localized",
+                 "unvisited_address", "dangerous_area", "contact_with_carrier", "rescheduled_by_meli"}
+
+
+def estado_envio_meli(status, sub):
+    status, sub = (status or "").lower(), (sub or "").lower()
+    if status in ("", "pending", "handling"):
+        return "Pendiente"
+    if status == "ready_to_ship":
+        return "Despachado" if sub in ("dropped_off", "in_hub", "picked_up", "in_packing_list", "at_the_door") else "Listo para despachar"
+    if status == "shipped":
+        if sub == "out_for_delivery":
+            return "En reparto"
+        if sub in ("waiting_for_withdrawal", "ready_to_pickup"):
+            return "Listo para retirar"
+        if sub in FALLA_ENTREGA:
+            return "Intento fallido"
+        return "En camino"
+    if status == "delivered":
+        return "Entregado"
+    if status == "not_delivered":
+        return "Devolución" if "return" in sub else "No entregado"
+    if status == "cancelled":
+        return "Cancelado"
+    return "Pendiente"
+
+
+def num(v):
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+class MeliReporte:
+    def __init__(self, marca, tok):
+        self.marca = marca
+        self.tok = tok
+        self.s = requests.Session()
+        self.s.headers["Authorization"] = f"Bearer {tok['access_token']}"
+        self._renovado = False
+        self._lock = threading.Lock()
+
+    def get(self, path, params=None):
+        r = None
+        for intento in range(5):
+            try:
+                r = self.s.get(f"{MELI_API}{path}", params=params, timeout=30)
+            except requests.RequestException:
+                time_lib.sleep(2 * (intento + 1))
+                continue
+            if r.status_code == 401:
+                with self._lock:
+                    if not self._renovado:
+                        self.tok = token_vigente(self.marca, forzar=True)
+                        self.s.headers["Authorization"] = f"Bearer {self.tok['access_token']}"
+                        self._renovado = True
+                        continue
+                return r
+            if r.status_code == 429 or r.status_code >= 500:
+                time_lib.sleep(2 * (intento + 1))
+                continue
+            return r
+        return r
+
+    def buscar_ordenes(self, desde, hasta, status_placeholder):
+        """Órdenes por fecha de creación, en ventanas de 3 días (el search no pagina más allá de ~10k)."""
+        ordenes, ini = [], desde
+        while ini < hasta:
+            fin = min(ini + timedelta(days=3), hasta)
+            offset = 0
+            while True:
+                params = {
+                    "seller": self.tok["user_id"],
+                    "order.date_created.from": ini.strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
+                    "order.date_created.to": fin.strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
+                    "sort": "date_asc", "limit": 50, "offset": offset,
+                }
+                r = self.get("/orders/search", params)
+                if r is None or r.status_code != 200:
+                    raise RuntimeError(f"/orders/search HTTP {getattr(r, 'status_code', '?')} {getattr(r, 'text', '')[:200]}")
+                d = r.json()
+                res = d.get("results", [])
+                ordenes.extend(res)
+                offset += len(res)
+                status_placeholder.text(f"{self.marca}: {len(ordenes)} órdenes descargadas...")
+                if not res or offset >= d.get("paging", {}).get("total", 0) or offset >= 9950:
+                    break
+            ini = fin
+        return list({o["id"]: o for o in ordenes}.values())
+
+    def envio(self, shipping_id):
+        """Estado del envío + costo que paga el vendedor."""
+        if not shipping_id:
+            return {}
+        out = {}
+        r = self.get(f"/shipments/{shipping_id}")
+        if r is not None and r.status_code == 200:
+            s = r.json()
+            out["estado_envio"] = estado_envio_meli(s.get("status"), s.get("substatus"))
+        c = self.get(f"/shipments/{shipping_id}/costs")
+        if c is not None and c.status_code == 200:
+            senders = c.json().get("senders") or []
+            out["costo_vendedor"] = sum(num(x.get("cost")) for x in senders)
+        return out
+
+    def a_filas(self, o, env, envio_ya_contado):
+        pagos = [p for p in (o.get("payments") or []) if p]
+        aprobados = [p for p in pagos if p.get("status") in ("approved", "refunded", "charged_back", "partially_refunded")]
+        id_pago = ", ".join(str(p.get("id")) for p in (aprobados or pagos) if p.get("id"))
+
+        envio_comprador = sum(num(p.get("shipping_cost")) for p in aprobados)
+
+        reembolso = 0.0
+        for p in pagos:
+            ref = num(p.get("transaction_amount_refunded"))
+            if not ref and p.get("status") in ("refunded", "charged_back"):
+                ref = num(p.get("total_paid_amount")) or num(p.get("transaction_amount"))
+            reembolso += ref
+
+        fecha = pd.Timestamp(o["date_created"]).tz_convert(ZONA_AR)
+        shipping_id = (o.get("shipping") or {}).get("id")
+        estado_pedido = env.get("estado_envio", "S/D") if shipping_id else "Sin envío (acordar)"
+
+        filas = []
+        for i, oi in enumerate(o.get("order_items") or [{}]):
+            item = oi.get("item") or {}
+            cant = int(oi.get("quantity") or 0)
+            primera = i == 0
+            filas.append({
+                "MARCA": self.marca,
+                "PACK ID": str(o.get("pack_id") or o["id"]),
+                "ORDEN MELI": str(o["id"]),
+                "ORDER ID MP (ID PAGO)": id_pago,
+                "FECHA": fecha.strftime("%d/%m/%Y"),
+                "ESTADO": ESTADO_ORDEN_MELI.get(o.get("status"), o.get("status", "")),
+                "ESTADO DEL PEDIDO": estado_pedido,
+                "SKU": str(item.get("seller_sku") or item.get("seller_custom_field") or item.get("id") or ""),
+                "DESCRIPCION": item.get("title", ""),
+                "CANTIDAD": cant,
+                "VALOR ARTICULO": num(oi.get("unit_price")) * cant,
+                # Importes a nivel orden/envío: solo en la primera línea, para no duplicar al sumar
+                "IMPORTE DEL ENVIO": envio_comprador if primera else 0.0,
+                "COSTO ENVIO VENDEDOR": (env.get("costo_vendedor", 0.0)
+                                         if primera and shipping_id and shipping_id not in envio_ya_contado else 0.0),
+                "ANULACIONES Y REEMBOLSOS": reembolso if primera else 0.0,
+            })
+            if primera and shipping_id:
+                envio_ya_contado.add(shipping_id)
+        return filas
+
+
+def generar_meli(marca, start_date, end_date, status_placeholder):
+    rep = MeliReporte(marca, token_vigente(marca))
+    desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
+    hasta = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=ZONA_AR)
+
+    ordenes = rep.buscar_ordenes(desde, hasta, status_placeholder)
+
+    ship_ids = sorted({(o.get("shipping") or {}).get("id") for o in ordenes} - {None})
+    envios = {}
+    status_placeholder.text(f"{marca}: consultando {len(ship_ids)} envíos...")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for sid, env in zip(ship_ids, ex.map(rep.envio, ship_ids)):
+            envios[sid] = env
+
+    filas, contados = [], set()
+    for o in sorted(ordenes, key=lambda x: x.get("date_created", "")):
+        sid = (o.get("shipping") or {}).get("id")
+        filas.extend(rep.a_filas(o, envios.get(sid, {}), contados))
+    return ordenes, filas
+
+
+def descargar_excel(df, nombre_hoja, file_name, start_time):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=nombre_hoja)
+
+    elapsed = time_lib.time() - start_time
+    st.success(f"Reporte procesado en {elapsed:.0f} segundos.")
+
+    with st.expander("Ver vista previa"):
+        st.dataframe(df.head(50), use_container_width=True)
+
+    st.download_button(
+        label="Descargar Archivo",
+        data=output.getvalue(),
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+# ---------- Vuelta del login de MeLi (?code=...&state=Marca) ----------
+_qp = st.query_params
+if "code" in _qp and "state" in _qp and not MELI_FALTANTES:
+    _marca_cb = _qp.get("state")
+    _code_cb = _qp.get("code")
+    st.query_params.clear()
+    if _marca_cb in MELI_CUENTAS:
+        try:
+            _nick = conectar_cuenta(_marca_cb, _code_cb)
+            st.success(f"✅ {_marca_cb} conectada a MercadoLibre ({_nick}).")
+        except Exception as e:
+            st.error(f"No se pudo conectar {_marca_cb}: {e}")
+
+
 # --- Interfaz de Usuario ---
-st.title("Consolidador Shopify")
+st.title("Consolidador de Ventas")
 st.write("---")
+
+canal = st.radio("Canal", ["Shopify", "MercadoLibre"], horizontal=True)
+
+if canal == "MercadoLibre":
+    if MELI_FALTANTES:
+        st.error("Faltan en los secrets, sección [meli]: " + ", ".join(MELI_FALTANTES))
+        if "fernet_key" in MELI_FALTANTES:
+            st.caption("fernet_key: podés usar esta (generada recién, copiala a los secrets):")
+            st.code(Fernet.generate_key().decode())
+        st.stop()
+
+    with st.expander("⚙️ Cuentas de MercadoLibre"):
+        st.caption("Para conectar: iniciá sesión en mercadolibre.com.ar con la cuenta de esa marca "
+                   "en este navegador y tocá su botón. Se hace una sola vez por cuenta.")
+        try:
+            estado_tk = _estado_tokens()
+            with estado_tk["lock"]:
+                conectadas = dict(_cargar_tokens(estado_tk))
+        except Exception as e:
+            conectadas = {}
+            st.error(str(e))
+        for m in MELI_CUENTAS:
+            c1, c2 = st.columns([3, 2])
+            info = conectadas.get(m)
+            c1.write(f"**{m}** — " + (f"✅ {info.get('nickname') or info.get('user_id')}" if info else "❌ sin conectar"))
+            url = f"{MELI_AUTH}?" + urlencode({"response_type": "code", "client_id": MELI_APP_ID,
+                                               "redirect_uri": MELI_REDIRECT, "state": m})
+            c2.link_button("Reconectar" if info else "Conectar", url)
 
 col1, col2 = st.columns(2)
 with col1:
     date_range = st.date_input("Rango de Fechas", [])
 with col2:
-    available_brands = list(STORES.keys())
-    selected_brands = st.multiselect("Marcas", available_brands, default=available_brands)
+    available_brands = list(STORES.keys()) if canal == "Shopify" else MELI_CUENTAS
+    selected_brands = st.multiselect("Marcas", available_brands, default=available_brands, key=f"marcas_{canal}")
 
 st.write("")
 
 if st.button("Generar Reporte", type="primary"):
-    if len(date_range) != 2:
+    if canal == "Shopify" and not STORES:
+        st.error("Credenciales de Shopify no configuradas en st.secrets.")
+    elif len(date_range) != 2:
         st.warning("Seleccioná fecha de inicio y fin.")
     elif not selected_brands:
         st.warning("Seleccioná al menos una marca.")
     else:
         start_date, end_date = date_range
         all_data = []
-
-        start_str = datetime.combine(start_date, datetime.min.time()).isoformat() + "-03:00"
-        end_str = datetime.combine(end_date, datetime.max.time()).isoformat() + "-03:00"
-
         start_time = time_lib.time()
         progress_bar = st.progress(0)
         status_placeholder = st.empty()
 
-        for i, marca in enumerate(selected_brands):
-            store_info = STORES[marca]
-            try:
-                status_placeholder.text(f"{marca}: verificando permisos...")
-                test_query_permissions(store_info, start_str, end_str)
+        if canal == "Shopify":
+            start_str = datetime.combine(start_date, datetime.min.time()).isoformat() + "-03:00"
+            end_str = datetime.combine(end_date, datetime.max.time()).isoformat() + "-03:00"
 
-                status_placeholder.text(f"{marca}: iniciando exportación...")
-                inner_query = build_inner_query(start_str, end_str)
-                run_bulk_query(store_info, inner_query)
+            for i, marca in enumerate(selected_brands):
+                store_info = STORES[marca]
+                try:
+                    status_placeholder.text(f"{marca}: verificando permisos...")
+                    test_query_permissions(store_info, start_str, end_str)
 
-                download_url = wait_for_bulk_operation(store_info, status_placeholder, marca)
-                raw_rows = download_jsonl(download_url)
+                    status_placeholder.text(f"{marca}: iniciando exportación...")
+                    inner_query = build_inner_query(start_str, end_str)
+                    run_bulk_query(store_info, inner_query)
 
-                orders = build_orders_from_bulk(raw_rows)
-                processed_rows = process_orders_bulk(orders, marca)
-                all_data.extend(processed_rows)
+                    download_url = wait_for_bulk_operation(store_info, status_placeholder, marca)
+                    raw_rows = download_jsonl(download_url)
 
-                st.caption(
-                    f"🔍 {marca}: {len(raw_rows)} objetos descargados del bulk, "
-                    f"{len(orders)} pedidos reconocidos, {len(processed_rows)} filas generadas."
-                )
-            except RuntimeError as e:
-                st.error(f"{marca}: error durante la exportación — {e}")
+                    orders = build_orders_from_bulk(raw_rows)
+                    processed_rows = process_orders_bulk(orders, marca)
+                    all_data.extend(processed_rows)
 
-            progress_bar.progress((i + 1) / len(selected_brands))
+                    st.caption(
+                        f"🔍 {marca}: {len(raw_rows)} objetos descargados del bulk, "
+                        f"{len(orders)} pedidos reconocidos, {len(processed_rows)} filas generadas."
+                    )
+                except RuntimeError as e:
+                    st.error(f"{marca}: error durante la exportación — {e}")
+
+                progress_bar.progress((i + 1) / len(selected_brands))
+
+        else:  # MercadoLibre
+            for i, marca in enumerate(selected_brands):
+                try:
+                    status_placeholder.text(f"{marca}: verificando token...")
+                    ordenes, filas = generar_meli(marca, start_date, end_date, status_placeholder)
+                    all_data.extend(filas)
+                    st.caption(f"🔍 {marca}: {len(ordenes)} órdenes, {len(filas)} filas generadas.")
+                except Exception as e:
+                    st.error(f"{marca}: error durante la exportación — {e}")
+
+                progress_bar.progress((i + 1) / len(selected_brands))
 
         progress_bar.empty()
         status_placeholder.empty()
 
         if all_data:
             df = pd.DataFrame(all_data)
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Ventas')
-
-            elapsed = time_lib.time() - start_time
-            st.success(f"Reporte procesado en {elapsed:.0f} segundos.")
-
-            with st.expander("Ver vista previa"):
-                st.dataframe(df.head(50), use_container_width=True)
-
-            st.download_button(
-                label="Descargar Archivo",
-                data=output.getvalue(),
-                file_name=f"Reporte_{start_date}_al_{end_date}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            if canal == "Shopify":
+                descargar_excel(df, "Ventas", f"Reporte_{start_date}_al_{end_date}.xlsx", start_time)
+            else:
+                descargar_excel(df, "Ventas MeLi", f"Reporte_MeLi_{start_date}_al_{end_date}.xlsx", start_time)
         else:
             st.info("No se registraron ventas en el período seleccionado.")
