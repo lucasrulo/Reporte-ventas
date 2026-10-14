@@ -710,25 +710,53 @@ def estado_devolucion(dev):
 
 class MeliDevoluciones(MeliReporte):
     def buscar_reclamos(self, desde, hasta, status_placeholder, resource_id=None):
-        reclamos, offset = [], 0
-        while True:
-            params = {"limit": 50, "offset": offset, "sort": "date_created:asc"}
-            if resource_id:
-                params["resource_id"] = resource_id
-            else:
-                params["range"] = (f"date_created:after:{desde.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')},"
-                                   f"before:{hasta.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')}")
-            r = self.get("/post-purchase/v1/claims/search", params)
-            if r is None or r.status_code != 200:
-                raise RuntimeError(f"/claims/search HTTP {getattr(r, 'status_code', '?')} {getattr(r, 'text', '')[:200]}")
-            d = r.json()
-            res = d.get("data") or d.get("results") or []
-            reclamos.extend(res)
-            offset += len(res)
-            status_placeholder.text(f"{self.marca}: {len(reclamos)} reclamos revisados...")
-            if not res or offset >= (d.get("paging") or {}).get("total", 0):
-                break
-        return reclamos
+        # MeLi exige al menos un filtro "real": filtramos por la cuenta vendedora (respondent).
+        base = {"players.role": "respondent", "players.user_id": self.tok["user_id"]}
+        if resource_id:
+            base["resource_id"] = resource_id
+        rango = (f"date_created:after:{desde.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')},"
+                 f"before:{hasta.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')}")
+        # Variantes por si MeLi rechaza algún parámetro (se usa la primera que responda 200)
+        variantes = [
+            {**base, "range": rango},
+            base,
+            {"resource_id": resource_id} if resource_id else {"site_id": "MLA", "range": rango},
+        ]
+
+        def fecha_reclamo(c):
+            try:
+                return pd.Timestamp(c.get("date_created")).tz_convert(ZONA_AR)
+            except Exception:
+                return None
+
+        ultimo_error = ""
+        for filtros in variantes:
+            reclamos, offset, ok = [], 0, True
+            while True:
+                params = {**filtros, "limit": 50, "offset": offset, "sort": "date_created:desc"}
+                r = self.get("/post-purchase/v1/claims/search", params)
+                if r is None or r.status_code != 200:
+                    ultimo_error = f"HTTP {getattr(r, 'status_code', '?')} {getattr(r, 'text', '')[:200]}"
+                    ok = False
+                    break
+                d = r.json()
+                res = d.get("data") or d.get("results") or []
+                reclamos.extend(res)
+                offset += len(res)
+                status_placeholder.text(f"{self.marca}: {len(reclamos)} reclamos revisados...")
+                if not res or offset >= (d.get("paging") or {}).get("total", 0):
+                    break
+                # Orden descendente: si ya pasamos el inicio del rango, cortamos
+                f_ult = fecha_reclamo(res[-1])
+                if not resource_id and f_ult is not None and f_ult < desde:
+                    break
+            if ok:
+                if resource_id:
+                    return reclamos
+                # Filtro por fecha del lado de la app (por si MeLi ignoró el 'range')
+                return [c for c in reclamos
+                        if (f := fecha_reclamo(c)) is None or desde <= f <= hasta]
+        raise RuntimeError(f"/claims/search {ultimo_error}")
 
     def devolucion(self, claim_id):
         r = self.get(f"/post-purchase/v2/claims/{claim_id}/returns")
