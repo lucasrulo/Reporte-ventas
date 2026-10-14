@@ -622,7 +622,7 @@ class MeliReporte:
         filas = []
         for i, oi in enumerate(o.get("order_items") or [{}]):
             item = oi.get("item") or {}
-            cant = int(oi.get("quantity") or 0)
+            cant = int(num(oi.get("quantity")))
             primera = i == 0
             filas.append({
                 "MARCA": self.marca,
@@ -796,7 +796,7 @@ class MeliDevoluciones(MeliReporte):
         for x in dev.get("orders") or []:
             q = x.get("return_quantity") or x.get("total_quantity")
             if x.get("item_id") and q:
-                cant_dev[str(x["item_id"])] = int(q)
+                cant_dev[str(x["item_id"])] = int(num(q))
 
         filas, contados = [], set()
         for o in ordenes:
