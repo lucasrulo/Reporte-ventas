@@ -734,12 +734,12 @@ def _cache_motivos():
 
 
 class MeliDevoluciones(MeliReporte):
-    def buscar_reclamos(self, desde, hasta, status_placeholder, resource_id=None):
+    def buscar_reclamos(self, desde, hasta, status_placeholder, resource_id=None, campo="date_created"):
         # MeLi exige al menos un filtro "real": filtramos por la cuenta vendedora (respondent).
         base = {"players.role": "respondent", "players.user_id": self.tok["user_id"]}
         if resource_id:
             base["resource_id"] = resource_id
-        rango = (f"date_created:after:{desde.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')},"
+        rango = (f"{campo}:after:{desde.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')},"
                  f"before:{hasta.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')}")
         # Variantes por si MeLi rechaza algún parámetro (se usa la primera que responda 200)
         variantes = [
@@ -750,7 +750,7 @@ class MeliDevoluciones(MeliReporte):
 
         def fecha_reclamo(c):
             try:
-                return pd.Timestamp(c.get("date_created")).tz_convert(ZONA_AR)
+                return pd.Timestamp(c.get(campo) or c.get("date_created")).tz_convert(ZONA_AR)
             except Exception:
                 return None
 
@@ -758,7 +758,7 @@ class MeliDevoluciones(MeliReporte):
         for filtros in variantes:
             reclamos, offset, ok = [], 0, True
             while True:
-                params = {**filtros, "limit": 50, "offset": offset, "sort": "date_created:desc"}
+                params = {**filtros, "limit": 50, "offset": offset, "sort": f"{campo}:desc"}
                 r = self.get("/post-purchase/v1/claims/search", params)
                 if r is None or r.status_code != 200:
                     ultimo_error = f"HTTP {getattr(r, 'status_code', '?')} {getattr(r, 'text', '')[:200]}"
@@ -828,9 +828,6 @@ class MeliDevoluciones(MeliReporte):
         return []
 
     def filas_reclamo(self, claim):
-        rel = claim.get("related_entities")
-        if rel is not None and "return" not in rel and claim.get("type") != "return":
-            return []
         dev = self.devolucion(claim["id"])
         if not dev:
             return []
@@ -855,6 +852,7 @@ class MeliDevoluciones(MeliReporte):
                 f.update({
                     "ID RECLAMO": str(claim["id"]),
                     "FECHA RECLAMO": _fecha_corta(claim.get("date_created")),
+                    "ULTIMA ACTUALIZACION": _fecha_corta(dev.get("last_updated") or claim.get("last_updated")),
                     "ESTADO DEVOLUCION": estado_devolucion(dev),
                     "ESTADO DINERO": ESTADO_DINERO.get(dev.get("status_money"), dev.get("status_money") or ""),
                     "DESTINO DEVOLUCION": DESTINO_DEV.get((envio_dev.get("destination") or {}).get("name"), ""),
@@ -867,11 +865,71 @@ class MeliDevoluciones(MeliReporte):
         return filas
 
 
-def generar_devoluciones(marca, start_date, end_date, status_placeholder, resource_id=None):
+def _ts(v):
+    try:
+        t = pd.Timestamp(v)
+        return t.tz_convert(ZONA_AR) if t.tzinfo else t.tz_localize(ZONA_AR)
+    except Exception:
+        return None
+
+
+def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
+    """Busca un pack u orden en una marca y explica qué pasa con su devolución.
+    Devuelve None si el ID no pertenece a esa cuenta."""
+    rep = MeliDevoluciones(marca, token_vigente(marca))
+    ordenes = rep.ordenes_de(None, id_txt)
+    if not ordenes:
+        return None
+    ids = {id_txt} | {str(o["id"]) for o in ordenes} | {str(o["pack_id"]) for o in ordenes if o.get("pack_id")}
+    hoy = datetime.now(ZONA_AR)
+    reclamos = {}
+    for rid in ids:
+        for c in rep.buscar_reclamos(hoy, hoy, status_placeholder, resource_id=rid):
+            reclamos[c["id"]] = c
+
+    filas, notas = [], []
+    if not reclamos:
+        for o in ordenes:
+            env = rep.envio((o.get("shipping") or {}).get("id"))
+            if env.get("status_raw") == "not_delivered":
+                notas.append(f"Orden {o['id']}: no tiene reclamo. El envío figura como **no entregado** "
+                             f"({env.get('estado_envio')}), así que vuelve sin reclamo de devolución → "
+                             "aparece en el reporte **Cancelados / No entregados**.")
+            elif o.get("status") == "cancelled":
+                notas.append(f"Orden {o['id']}: no tiene reclamo, la venta está **cancelada** → "
+                             "aparece en el reporte **Cancelados / No entregados**.")
+            else:
+                notas.append(f"Orden {o['id']}: MeLi no registra reclamos ni devoluciones "
+                             f"(estado del envío: {env.get('estado_envio', 'S/D')}).")
+        return filas, notas
+
+    for c in reclamos.values():
+        fr = rep.filas_reclamo(c)
+        abierto = _ts(c.get("date_created"))
+        actualizado = _ts(c.get("last_updated"))
+        txt = (f"Reclamo {c['id']} ({c.get('reason_id', '')}): abierto el "
+               f"{abierto.strftime('%d/%m/%Y') if abierto is not None else '?'}, última actualización "
+               f"{actualizado.strftime('%d/%m/%Y') if actualizado is not None else '?'}.")
+        if not fr:
+            txt += " **No tiene devolución asociada** (es una mediación/reclamo sin envío de vuelta)."
+        elif rango:
+            d0 = datetime.combine(rango[0], datetime.min.time()).replace(tzinfo=ZONA_AR)
+            d1 = datetime.combine(rango[1], datetime.max.time()).replace(tzinfo=ZONA_AR)
+            if abierto is not None and not (d0 <= abierto <= d1):
+                txt += (" ⚠️ Se abrió **fuera del rango** seleccionado: con 'Fecha de apertura del reclamo' no "
+                        "aparece; probá con 'Última actualización'.")
+            else:
+                txt += " ✅ Debería aparecer en el reporte del rango seleccionado."
+        notas.append(txt)
+        filas.extend(fr)
+    return filas, notas
+
+
+def generar_devoluciones(marca, start_date, end_date, status_placeholder, resource_id=None, campo="date_created"):
     rep = MeliDevoluciones(marca, token_vigente(marca))
     desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
     hasta = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=ZONA_AR)
-    reclamos = rep.buscar_reclamos(desde, hasta, status_placeholder, resource_id)
+    reclamos = rep.buscar_reclamos(desde, hasta, status_placeholder, resource_id, campo=campo)
     status_placeholder.text(f"{marca}: revisando {len(reclamos)} reclamos con posible devolución...")
     filas = []
     with ThreadPoolExecutor(max_workers=6) as ex:
@@ -881,7 +939,7 @@ def generar_devoluciones(marca, start_date, end_date, status_placeholder, resour
 
 
 COLUMNAS_DEVOLUCION = [
-    "MARCA", "PACK ID", "ORDEN MELI", "ORDER ID MP (ID PAGO)", "ID RECLAMO", "FECHA", "FECHA RECLAMO",
+    "MARCA", "PACK ID", "ORDEN MELI", "ORDER ID MP (ID PAGO)", "ID RECLAMO", "FECHA", "FECHA RECLAMO", "ULTIMA ACTUALIZACION",
     "ESTADO", "ESTADO DEL PEDIDO", "ESTADO DEVOLUCION", "ESTADO DINERO", "DESTINO DEVOLUCION",
     "TRACKING DEVOLUCION", "MOTIVO", "CODIGO MOTIVO", "SKU", "DESCRIPCION", "CANTIDAD", "VALOR ARTICULO",
     "IMPORTE DEL ENVIO", "COSTO ENVIO VENDEDOR", "ANULACIONES Y REEMBOLSOS", "FECHA CIERRE",
@@ -911,14 +969,6 @@ COLUMNAS_CANCELADOS = [
     "ESTADO", "ESTADO DEL PEDIDO", "MOTIVO", "QUIEN CANCELA", "SKU", "DESCRIPCION", "CANTIDAD",
     "VALOR ARTICULO", "IMPORTE DEL ENVIO", "COSTO ENVIO VENDEDOR", "ANULACIONES Y REEMBOLSOS",
 ]
-
-
-def _ts(v):
-    try:
-        t = pd.Timestamp(v)
-        return t.tz_convert(ZONA_AR) if t.tzinfo else t.tz_localize(ZONA_AR)
-    except Exception:
-        return None
 
 
 def generar_cancelados(marca, start_date, end_date, status_placeholder):
@@ -1049,14 +1099,18 @@ if canal == "MercadoLibre":
             c2.link_button("Reconectar" if info else "Conectar", url)
 
 tipo_meli = "Ventas"
+campo_dev = "date_created"
 if canal == "MercadoLibre":
     tipo_meli = st.radio("Reporte", ["Ventas", "Devoluciones", "Cancelados / No entregados"], horizontal=True)
     if tipo_meli == "Cancelados / No entregados":
         st.caption("Trae las ventas pagadas que se cancelaron o cuyo envío no se entregó, "
                    "cuando la cancelación / no entrega ocurrió dentro del rango de fechas.")
     if tipo_meli == "Devoluciones":
-        st.caption("Trae los reclamos con devolución creados en el rango de fechas, "
-                   "con los datos de la venta original.")
+        fecha_dev = st.radio("Filtrar devoluciones por", ["Fecha de apertura del reclamo", "Última actualización"],
+                             horizontal=True,
+                             help="'Última actualización' incluye reclamos abiertos antes del rango que "
+                                  "tuvieron movimiento dentro del rango (ej. la devolución se preparó o llegó).")
+        campo_dev = "date_created" if fecha_dev.startswith("Fecha de apertura") else "last_updated"
 
 col1, col2 = st.columns(2)
 with col1:
@@ -1066,31 +1120,36 @@ with col2:
     selected_brands = st.multiselect("Marcas", available_brands, default=available_brands, key=f"marcas_{canal}")
 
 if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
-    with st.expander("🔎 Buscar la devolución de un pack / orden puntual"):
-        b1, b2 = st.columns([2, 1])
-        id_buscar = b1.text_input("Pack ID u orden de MeLi", key="id_dev")
-        marca_buscar = b2.selectbox("Marca", MELI_CUENTAS, key="marca_dev")
-        if st.button("Buscar") and id_buscar.strip():
+    with st.expander("🔎 Buscar devoluciones de packs / órdenes puntuales"):
+        ids_txt = st.text_area("Pack IDs u órdenes de MeLi (uno por línea)", key="ids_dev", height=100)
+        if st.button("Buscar") and ids_txt.strip():
             ph = st.empty()
-            hoy = datetime.now(ZONA_AR).date()
-            try:
-                encontrados, filas_b = [], []
-                for rid in dict.fromkeys([id_buscar.strip()]):
-                    recl, filas_x = generar_devoluciones(marca_buscar, hoy, hoy, ph, resource_id=rid)
-                    encontrados += recl
+            rango_sel = date_range if len(date_range) == 2 else None
+            filas_b = []
+            for id_x in dict.fromkeys(x.strip() for x in ids_txt.replace(",", "\n").splitlines() if x.strip()):
+                encontrado = False
+                for m in MELI_CUENTAS:
+                    try:
+                        res = diagnosticar_devolucion(m, id_x, rango_sel, ph)
+                    except Exception as e:
+                        if "no conectada" not in str(e):
+                            st.warning(f"{id_x} / {m}: {e}")
+                        continue
+                    if res is None:
+                        continue
+                    encontrado = True
+                    filas_x, notas = res
+                    st.markdown(f"**{id_x}** — {m}")
+                    for n in notas:
+                        st.markdown(f"- {n}")
                     filas_b += filas_x
-                ph.empty()
-                if filas_b:
-                    df_b = pd.DataFrame(filas_b)
-                    st.dataframe(df_b[[c for c in COLUMNAS_DEVOLUCION if c in df_b.columns]], use_container_width=True)
-                elif encontrados:
-                    st.info(f"Encontré {len(encontrados)} reclamo(s) pero sin devolución asociada.")
-                    st.json(encontrados[:3])
-                else:
-                    st.info("No hay reclamos para ese ID en esa marca.")
-            except Exception as e:
-                ph.empty()
-                st.error(str(e))
+                    break
+                if not encontrado:
+                    st.markdown(f"**{id_x}** — no lo encontré en ninguna de las cuentas conectadas.")
+            ph.empty()
+            if filas_b:
+                df_b = pd.DataFrame(filas_b)
+                st.dataframe(df_b[[c for c in COLUMNAS_DEVOLUCION if c in df_b.columns]], use_container_width=True)
 
 st.write("")
 
@@ -1146,7 +1205,8 @@ if st.button("Generar Reporte", type="primary"):
                         ordenes, filas = generar_meli(marca, start_date, end_date, status_placeholder)
                         st.caption(f"🔍 {marca}: {len(ordenes)} órdenes, {len(filas)} filas generadas.")
                     elif tipo_meli == "Devoluciones":
-                        reclamos, filas = generar_devoluciones(marca, start_date, end_date, status_placeholder)
+                        reclamos, filas = generar_devoluciones(marca, start_date, end_date, status_placeholder,
+                                                               campo=campo_dev)
                         st.caption(f"🔍 {marca}: {len(reclamos)} reclamos revisados, {len(filas)} filas de devolución.")
                     else:
                         candidatas, filas = generar_cancelados(marca, start_date, end_date, status_placeholder)
