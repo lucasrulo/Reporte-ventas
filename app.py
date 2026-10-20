@@ -597,8 +597,15 @@ class MeliReporte:
             out["estado_envio"] = estado_envio_meli(s.get("status"), s.get("substatus"))
         c = self.get(f"/shipments/{shipping_id}/costs")
         if c is not None and c.status_code == 200:
-            senders = c.json().get("senders") or []
+            cj = c.json()
+            senders = cj.get("senders") or []
             out["costo_vendedor"] = sum(num(x.get("cost")) for x in senders)
+            # Lo que pagó el comprador por el envío (en ME2 no siempre viene en el pago)
+            receiver = cj.get("receiver") or {}
+            if isinstance(receiver, list):
+                out["costo_comprador"] = sum(num(x.get("cost")) for x in receiver)
+            else:
+                out["costo_comprador"] = num(receiver.get("cost"))
         return out
 
     def a_filas(self, o, env, envio_ya_contado):
@@ -607,6 +614,10 @@ class MeliReporte:
         id_pago = ", ".join(str(p.get("id")) for p in (aprobados or pagos) if p.get("id"))
 
         envio_comprador = sum(num(p.get("shipping_cost")) for p in aprobados)
+        shipping_id = (o.get("shipping") or {}).get("id")
+        if not envio_comprador and shipping_id and shipping_id not in envio_ya_contado:
+            # Respaldo: costo del envío que figura para el comprador en /shipments/{id}/costs
+            envio_comprador = env.get("costo_comprador", 0.0)
 
         reembolso = 0.0
         for p in pagos:
@@ -616,7 +627,6 @@ class MeliReporte:
             reembolso += ref
 
         fecha = pd.Timestamp(o["date_created"]).tz_convert(ZONA_AR)
-        shipping_id = (o.get("shipping") or {}).get("id")
         estado_pedido = env.get("estado_envio", "S/D") if shipping_id else "Sin envío (acordar)"
 
         filas = []
