@@ -560,8 +560,9 @@ class MeliReporte:
             return r
         return r
 
-    def buscar_ordenes(self, desde, hasta, status_placeholder):
-        """Órdenes por fecha de creación, en ventanas de 3 días (el search no pagina más allá de ~10k)."""
+    def buscar_ordenes(self, desde, hasta, status_placeholder, campo="order.date_created"):
+        """Órdenes por fecha (creación o última actualización), en ventanas de 3 días
+        (el search no pagina más allá de ~10k)."""
         ordenes, ini = [], desde
         while ini < hasta:
             fin = min(ini + timedelta(days=3), hasta)
@@ -569,8 +570,8 @@ class MeliReporte:
             while True:
                 params = {
                     "seller": self.tok["user_id"],
-                    "order.date_created.from": ini.strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
-                    "order.date_created.to": fin.strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
+                    f"{campo}.from": ini.strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
+                    f"{campo}.to": fin.strftime("%Y-%m-%dT%H:%M:%S.000-03:00"),
                     "sort": "date_asc", "limit": 50, "offset": offset,
                 }
                 r = self.get("/orders/search", params)
@@ -595,6 +596,11 @@ class MeliReporte:
         if r is not None and r.status_code == 200:
             s = r.json()
             out["estado_envio"] = estado_envio_meli(s.get("status"), s.get("substatus"))
+            out["status_raw"] = (s.get("status") or "").lower()
+            out["substatus_raw"] = (s.get("substatus") or "").lower()
+            hist = s.get("status_history") or {}
+            out["fecha_no_entrega"] = (hist.get("date_not_delivered") or hist.get("date_returned")
+                                       or hist.get("date_cancelled") or s.get("last_updated"))
         c = self.get(f"/shipments/{shipping_id}/costs")
         if c is not None and c.status_code == 200:
             cj = c.json()
@@ -882,6 +888,101 @@ COLUMNAS_DEVOLUCION = [
 ]
 
 
+# ---------- Cancelados y no entregados ----------
+QUIEN_CANCELA = {"buyer": "Comprador", "seller": "Vendedor", "mediator": "MercadoLibre",
+                 "meli": "MercadoLibre", "shipment": "Logística MeLi", "fraud": "MercadoLibre (fraude)"}
+MOTIVO_NO_ENTREGA = {
+    "returning_to_sender": "Volviendo al vendedor",
+    "returned_to_sender": "Devuelto al vendedor",
+    "returned": "Devuelto al vendedor",
+    "receiver_absent": "Comprador ausente",
+    "bad_address": "Dirección incorrecta",
+    "not_visited": "Domicilio no visitado",
+    "damaged": "Paquete dañado",
+    "lost": "Paquete perdido",
+    "stolen": "Paquete robado",
+    "refused_delivery": "Entrega rechazada por el comprador",
+    "to_review": "En revisión",
+    "unclaimed": "No retirado por el comprador",
+    "delivery_failed": "Entrega fallida",
+}
+COLUMNAS_CANCELADOS = [
+    "MARCA", "TIPO", "PACK ID", "ORDEN MELI", "ORDER ID MP (ID PAGO)", "FECHA", "FECHA EVENTO",
+    "ESTADO", "ESTADO DEL PEDIDO", "MOTIVO", "QUIEN CANCELA", "SKU", "DESCRIPCION", "CANTIDAD",
+    "VALOR ARTICULO", "IMPORTE DEL ENVIO", "COSTO ENVIO VENDEDOR", "ANULACIONES Y REEMBOLSOS",
+]
+
+
+def _ts(v):
+    try:
+        t = pd.Timestamp(v)
+        return t.tz_convert(ZONA_AR) if t.tzinfo else t.tz_localize(ZONA_AR)
+    except Exception:
+        return None
+
+
+def generar_cancelados(marca, start_date, end_date, status_placeholder):
+    """Órdenes canceladas o con envío no entregado cuyo evento ocurrió en el rango.
+    Se buscan por fecha de ÚLTIMA ACTUALIZACIÓN (desde el inicio del rango hasta hoy), porque la
+    cancelación o la no entrega pasan después de la venta; luego se filtra por la fecha del evento."""
+    rep = MeliReporte(marca, token_vigente(marca))
+    desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
+    hasta = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=ZONA_AR)
+    ahora = datetime.now(ZONA_AR)
+
+    ordenes = rep.buscar_ordenes(desde, max(hasta, ahora), status_placeholder, campo="order.date_last_updated")
+
+    def fue_pagada(o):
+        return any((p or {}).get("status") in ("approved", "refunded", "charged_back", "partially_refunded",
+                                                  "in_mediation")
+                   for p in (o.get("payments") or []))
+
+    # Candidatas: canceladas (pagadas) + todo lo que no figura como entregado
+    candidatas = [o for o in ordenes
+                  if fue_pagada(o) and (o.get("status") == "cancelled" or "delivered" not in (o.get("tags") or []))]
+    ship_ids = sorted({(o.get("shipping") or {}).get("id") for o in candidatas} - {None})
+    envios = {}
+    status_placeholder.text(f"{marca}: revisando {len(ship_ids)} envíos...")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for sid, env in zip(ship_ids, ex.map(rep.envio, ship_ids)):
+            envios[sid] = env
+
+    filas, contados = [], set()
+    for o in sorted(candidatas, key=lambda x: x.get("date_created", "")):
+        sid = (o.get("shipping") or {}).get("id")
+        env = envios.get(sid, {})
+        no_entregado = env.get("status_raw") == "not_delivered"
+        cancelado = o.get("status") == "cancelled"
+        if not (no_entregado or cancelado):
+            continue
+
+        cd = o.get("cancel_detail") or {}
+        if no_entregado:
+            tipo = "No entregado" + (" (cancelado)" if cancelado else "")
+            fecha_ev = _ts(env.get("fecha_no_entrega")) or _ts(o.get("date_last_updated"))
+            motivo = MOTIVO_NO_ENTREGA.get(env.get("substatus_raw"), env.get("substatus_raw") or "No entregado")
+            quien = ""
+        else:
+            tipo = "Cancelado"
+            fecha_ev = _ts(cd.get("date")) or _ts(o.get("date_closed")) or _ts(o.get("date_last_updated"))
+            motivo = cd.get("description") or cd.get("code") or ""
+            quien = QUIEN_CANCELA.get(str(cd.get("requested_by") or cd.get("group") or "").lower(),
+                                      cd.get("requested_by") or cd.get("group") or "")
+
+        if fecha_ev is None or not (desde <= fecha_ev <= hasta):
+            continue
+
+        for f in rep.a_filas(o, env, contados):
+            f.update({
+                "TIPO": tipo,
+                "FECHA EVENTO": fecha_ev.strftime("%d/%m/%Y"),
+                "MOTIVO": motivo,
+                "QUIEN CANCELA": quien,
+            })
+            filas.append(f)
+    return candidatas, filas
+
+
 def descargar_excel(df, nombre_hoja, file_name, start_time):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -949,7 +1050,10 @@ if canal == "MercadoLibre":
 
 tipo_meli = "Ventas"
 if canal == "MercadoLibre":
-    tipo_meli = st.radio("Reporte", ["Ventas", "Devoluciones"], horizontal=True)
+    tipo_meli = st.radio("Reporte", ["Ventas", "Devoluciones", "Cancelados / No entregados"], horizontal=True)
+    if tipo_meli == "Cancelados / No entregados":
+        st.caption("Trae las ventas pagadas que se cancelaron o cuyo envío no se entregó, "
+                   "cuando la cancelación / no entrega ocurrió dentro del rango de fechas.")
     if tipo_meli == "Devoluciones":
         st.caption("Trae los reclamos con devolución creados en el rango de fechas, "
                    "con los datos de la venta original.")
@@ -1041,9 +1145,12 @@ if st.button("Generar Reporte", type="primary"):
                     if tipo_meli == "Ventas":
                         ordenes, filas = generar_meli(marca, start_date, end_date, status_placeholder)
                         st.caption(f"🔍 {marca}: {len(ordenes)} órdenes, {len(filas)} filas generadas.")
-                    else:
+                    elif tipo_meli == "Devoluciones":
                         reclamos, filas = generar_devoluciones(marca, start_date, end_date, status_placeholder)
                         st.caption(f"🔍 {marca}: {len(reclamos)} reclamos revisados, {len(filas)} filas de devolución.")
+                    else:
+                        candidatas, filas = generar_cancelados(marca, start_date, end_date, status_placeholder)
+                        st.caption(f"🔍 {marca}: {len(candidatas)} órdenes revisadas, {len(filas)} filas canceladas / no entregadas.")
                     all_data.extend(filas)
                 except Exception as e:
                     st.error(f"{marca}: error durante la exportación — {e}")
@@ -1060,10 +1167,18 @@ if st.button("Generar Reporte", type="primary"):
             elif tipo_meli == "Ventas":
                 df = df.drop(columns=["_item_id", "_unit_price"], errors="ignore")
                 descargar_excel(df, "Ventas MeLi", f"Reporte_MeLi_{start_date}_al_{end_date}.xlsx", start_time)
-            else:
+            elif tipo_meli == "Devoluciones":
                 df = df[[c for c in COLUMNAS_DEVOLUCION if c in df.columns]]
                 descargar_excel(df, "Devoluciones MeLi",
                                 f"Devoluciones_MeLi_{start_date}_al_{end_date}.xlsx", start_time)
+            else:
+                df = df[[c for c in COLUMNAS_CANCELADOS if c in df.columns]]
+                descargar_excel(df, "Cancelados MeLi",
+                                f"Cancelados_NoEntregados_MeLi_{start_date}_al_{end_date}.xlsx", start_time)
         else:
-            st.info("No se registraron " + ("devoluciones" if canal == "MercadoLibre" and tipo_meli == "Devoluciones"
-                                            else "ventas") + " en el período seleccionado.")
+            que = "ventas"
+            if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
+                que = "devoluciones"
+            elif canal == "MercadoLibre" and tipo_meli != "Ventas":
+                que = "cancelaciones ni envíos no entregados"
+            st.info(f"No se registraron {que} en el período seleccionado.")
