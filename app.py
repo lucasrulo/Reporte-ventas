@@ -721,7 +721,28 @@ def estado_devolucion(dev):
         return "Devolución en preparación"
     if env_st == "shipped" and st_ not in ("delivered", "closed", "cancelled"):
         return "En camino al vendedor"
+    dinero = (dev.get("status_money") or "").lower()
+    llego = st_ == "delivered" or env_st == "delivered"
+    if st_ in ("delivered", "closed") or llego:
+        if dinero == "refunded":
+            return "Finalizada con reembolso al comprador"
+        if dinero == "available":
+            return "Finalizada, dinero liberado al vendedor"
+        if llego:
+            return "Recibida (reembolso pendiente)"
     return ESTADO_DEVOLUCION.get(st_, st_ or "S/D")
+
+
+def fecha_recepcion_dev(dev):
+    """Fecha en que el paquete devuelto llegó (si ya llegó)."""
+    envio = dev.get("shipping") or (dev.get("shipments") or [{}])[0] or {}
+    hist = envio.get("status_history") or []
+    if isinstance(hist, dict):
+        return _fecha_corta(hist.get("date_delivered"))
+    for h in hist:
+        if (h.get("status") or "").lower() == "delivered":
+            return _fecha_corta(h.get("date"))
+    return ""
 
 
 PREFIJO_MOTIVO = {"PNR": "Producto no recibido", "PDD": "Producto defectuoso o distinto al publicado",
@@ -837,6 +858,13 @@ class MeliDevoluciones(MeliReporte):
         if not dev:
             return []
         ordenes = self.ordenes_de(claim.get("resource"), claim.get("resource_id") or dev.get("resource_id"))
+        # Si la devolución informa las órdenes incluidas (pack con varios productos), traerlas todas
+        ids_dev = [str(x.get("order_id")) for x in (dev.get("orders") or []) if x.get("order_id")]
+        ya = {str(o.get("id")) for o in ordenes}
+        for oid in ids_dev:
+            if oid not in ya:
+                ordenes += self.ordenes_de("order", oid)
+                ya.add(oid)
         envio_dev = dev.get("shipping") or (dev.get("shipments") or [{}])[0] or {}
         # Cantidades devueltas por ítem (si MeLi las informa; si no, se toma la cantidad vendida)
         cant_dev = {}
@@ -864,6 +892,7 @@ class MeliDevoluciones(MeliReporte):
                     "TRACKING DEVOLUCION": str(envio_dev.get("tracking_number") or ""),
                     "MOTIVO": self.motivo(claim.get("reason_id")),
                     "CODIGO MOTIVO": claim.get("reason_id", ""),
+                    "FECHA RECEPCION": fecha_recepcion_dev(dev),
                     "FECHA CIERRE": _fecha_corta(dev.get("date_closed")),
                 })
                 filas.append(f)
@@ -958,7 +987,7 @@ COLUMNAS_DEVOLUCION = [
     "MARCA", "PACK ID", "ORDEN MELI", "ORDER ID MP (ID PAGO)", "ID RECLAMO", "FECHA", "FECHA RECLAMO", "ULTIMA ACTUALIZACION",
     "ESTADO", "ESTADO DEL PEDIDO", "ESTADO DEVOLUCION", "ESTADO DINERO", "DESTINO DEVOLUCION",
     "TRACKING DEVOLUCION", "MOTIVO", "CODIGO MOTIVO", "SKU", "DESCRIPCION", "CANTIDAD", "VALOR ARTICULO",
-    "IMPORTE DEL ENVIO", "COSTO ENVIO VENDEDOR", "ANULACIONES Y REEMBOLSOS", "FECHA CIERRE",
+    "IMPORTE DEL ENVIO", "COSTO ENVIO VENDEDOR", "ANULACIONES Y REEMBOLSOS", "FECHA RECEPCION", "FECHA CIERRE",
 ]
 
 
