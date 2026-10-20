@@ -829,6 +829,23 @@ class MeliDevoluciones(MeliReporte):
         cache[reason_id] = texto
         return texto
 
+    def obtener_reclamo(self, claim_id):
+        for path in (f"/post-purchase/v1/claims/{claim_id}", f"/marketplace/v2/claims/{claim_id}"):
+            r = self.get(path)
+            if r is not None and r.status_code == 200 and r.json():
+                return r.json()
+        return None
+
+    @staticmethod
+    def mediaciones_de(o):
+        """IDs de reclamos que la propia orden informa (campo 'mediations')."""
+        out = []
+        for m in o.get("mediations") or []:
+            mid = m.get("id") if isinstance(m, dict) else m
+            if mid:
+                out.append(mid)
+        return out
+
     def devolucion(self, claim_id):
         r = self.get(f"/post-purchase/v2/claims/{claim_id}/returns")
         if r is None or r.status_code != 200:
@@ -918,6 +935,10 @@ def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
     hoy = datetime.now(ZONA_AR)
     reclamos = {}
     ids_orden = {str(o["id"]) for o in ordenes}
+    tecnico = {"ordenes": [{"id": o.get("id"), "pack_id": o.get("pack_id"), "status": o.get("status"),
+                            "tags": o.get("tags"), "mediations": o.get("mediations"),
+                            "cancel_detail": o.get("cancel_detail")} for o in ordenes],
+               "busquedas": []}
     errores, intentos = [], 0
     for rid in ids:
         # El reclamo puede estar sobre la orden o sobre el pack/compra
@@ -925,10 +946,22 @@ def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
         for tipo in tipos:
             intentos += 1
             try:
-                for c in rep.buscar_reclamos(hoy, hoy, status_placeholder, resource_id=rid, resource=tipo):
+                encontrados = rep.buscar_reclamos(hoy, hoy, status_placeholder, resource_id=rid, resource=tipo)
+                for c in encontrados:
                     reclamos[c["id"]] = c
+                tecnico["busquedas"].append(f"{tipo}={rid}: {len(encontrados)} reclamo(s)")
             except RuntimeError as e:
                 errores.append(str(e))
+                tecnico["busquedas"].append(f"{tipo}={rid}: {str(e)[:150]}")
+    # Reclamos que la orden informa directamente (no siempre aparecen en la búsqueda)
+    for o in ordenes:
+        for mid in rep.mediaciones_de(o):
+            if mid in reclamos or str(mid) in {str(k) for k in reclamos}:
+                continue
+            c = rep.obtener_reclamo(mid)
+            tecnico["busquedas"].append(f"mediation {mid} de la orden {o['id']}: {'OK' if c else 'no accesible'}")
+            if c:
+                reclamos[c["id"]] = c
     if not reclamos and errores and len(errores) == intentos:
         raise RuntimeError(errores[0])
 
@@ -946,7 +979,7 @@ def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
             else:
                 notas.append(f"Orden {o['id']}: MeLi no registra reclamos ni devoluciones "
                              f"(estado del envío: {env.get('estado_envio', 'S/D')}).")
-        return filas, notas
+        return filas, notas, tecnico
 
     for c in reclamos.values():
         fr = rep.filas_reclamo(c)
@@ -967,7 +1000,7 @@ def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
                 txt += " ✅ Debería aparecer en el reporte del rango seleccionado."
         notas.append(txt)
         filas.extend(fr)
-    return filas, notas
+    return filas, notas, tecnico
 
 
 def generar_devoluciones(marca, start_date, end_date, status_placeholder, resource_id=None, campo="date_created"):
@@ -975,6 +1008,22 @@ def generar_devoluciones(marca, start_date, end_date, status_placeholder, resour
     desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
     hasta = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=ZONA_AR)
     reclamos = rep.buscar_reclamos(desde, hasta, status_placeholder, resource_id, campo=campo)
+    if not resource_id:
+        # Complemento: órdenes con movimiento desde el inicio del rango que informan reclamos
+        # (algunas devoluciones, ej. arrepentimiento, no aparecen en la búsqueda de reclamos)
+        ya = {str(c.get("id")) for c in reclamos}
+        ordenes = rep.buscar_ordenes(desde, max(hasta, datetime.now(ZONA_AR)), status_placeholder,
+                                     campo="order.date_last_updated")
+        nuevos = [mid for o in ordenes for mid in rep.mediaciones_de(o) if str(mid) not in ya]
+        nuevos = list(dict.fromkeys(nuevos))
+        status_placeholder.text(f"{marca}: revisando {len(nuevos)} reclamos informados por las órdenes...")
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for c in ex.map(rep.obtener_reclamo, nuevos):
+                if not c:
+                    continue
+                f = _ts(c.get(campo) or c.get("date_created"))
+                if f is None or desde <= f <= hasta:
+                    reclamos.append(c)
     status_placeholder.text(f"{marca}: revisando {len(reclamos)} reclamos con posible devolución...")
     filas = []
     with ThreadPoolExecutor(max_workers=6) as ex:
@@ -1167,6 +1216,7 @@ with col2:
 if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
     with st.expander("🔎 Buscar devoluciones de packs / órdenes puntuales"):
         ids_txt = st.text_area("Pack IDs u órdenes de MeLi (uno por línea)", key="ids_dev", height=100)
+        ver_tecnico = st.checkbox("Mostrar datos técnicos (para diagnóstico)", key="tec_dev")
         if st.button("Buscar") and ids_txt.strip():
             ph = st.empty()
             rango_sel = date_range if len(date_range) == 2 else None
@@ -1183,10 +1233,12 @@ if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
                     if res is None:
                         continue
                     encontrado = True
-                    filas_x, notas = res
+                    filas_x, notas, tecnico = res
                     st.markdown(f"**{id_x}** — {m}")
                     for n in notas:
                         st.markdown(f"- {n}")
+                    if ver_tecnico:
+                        st.json(tecnico, expanded=False)
                     filas_b += filas_x
                     break
                 if not encontrado:
