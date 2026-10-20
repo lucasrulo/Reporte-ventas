@@ -973,8 +973,13 @@ def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
                 notas.append(f"Orden {o['id']}: no tiene reclamo. El envío figura como **no entregado** "
                              f"({env.get('estado_envio')}), así que vuelve sin reclamo de devolución → "
                              "aparece en el reporte **Cancelados / No entregados**.")
+            elif es_devolucion(rep, o, env):
+                notas.append(f"Orden {o['id']}: cancelada **después de entregada** (devolución con reembolso). "
+                             "MeLi no expone el reclamo, pero entra igual en el reporte de **Devoluciones** "
+                             "(por la fecha de cancelación).")
+                filas.extend(filas_devolucion_sin_reclamo(rep, o, env, set()))
             elif o.get("status") == "cancelled":
-                notas.append(f"Orden {o['id']}: no tiene reclamo, la venta está **cancelada** → "
+                notas.append(f"Orden {o['id']}: cancelada antes de entregarse, sin devolución → "
                              "aparece en el reporte **Cancelados / No entregados**.")
             else:
                 notas.append(f"Orden {o['id']}: MeLi no registra reclamos ni devoluciones "
@@ -1003,11 +1008,47 @@ def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
     return filas, notas, tecnico
 
 
+def es_devolucion(rep, o, env):
+    """Orden cancelada que en realidad es una devolución: se entregó y después se canceló/reembolsó,
+    o tiene un reclamo con devolución asociada."""
+    if o.get("status") != "cancelled":
+        return False
+    if env.get("status_raw") == "delivered" or "delivered" in (o.get("tags") or []):
+        return True
+    return any(rep.devolucion(mid) for mid in rep.mediaciones_de(o))
+
+
+def filas_devolucion_sin_reclamo(rep, o, env, contados):
+    """Devolución que MeLi no expone como reclamo: se arma con los datos de la cancelación."""
+    cd = o.get("cancel_detail") or {}
+    reembolsado = any((p or {}).get("status") in ("refunded", "partially_refunded", "charged_back")
+                      for p in (o.get("payments") or []))
+    filas = []
+    for f in rep.a_filas(o, env, contados):
+        f.update({
+            "ID RECLAMO": "",
+            "FECHA RECLAMO": "",
+            "ULTIMA ACTUALIZACION": _fecha_corta(o.get("date_last_updated")),
+            "ESTADO DEVOLUCION": ("Finalizada con reembolso al comprador" if reembolsado
+                                  else "Cancelada después de la entrega"),
+            "ESTADO DINERO": "Reembolsado al comprador" if reembolsado else "",
+            "DESTINO DEVOLUCION": "",
+            "TRACKING DEVOLUCION": "",
+            "MOTIVO": cd.get("description") or "Devolución (sin reclamo visible en la API)",
+            "CODIGO MOTIVO": cd.get("code") or "",
+            "FECHA RECEPCION": "",
+            "FECHA CIERRE": _fecha_corta(cd.get("date") or o.get("date_closed")),
+        })
+        filas.append(f)
+    return filas
+
+
 def generar_devoluciones(marca, start_date, end_date, status_placeholder, resource_id=None, campo="date_created"):
     rep = MeliDevoluciones(marca, token_vigente(marca))
     desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
     hasta = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=ZONA_AR)
     reclamos = rep.buscar_reclamos(desde, hasta, status_placeholder, resource_id, campo=campo)
+    ordenes = []
     if not resource_id:
         # Complemento: órdenes con movimiento desde el inicio del rango que informan reclamos
         # (algunas devoluciones, ej. arrepentimiento, no aparecen en la búsqueda de reclamos)
@@ -1029,6 +1070,24 @@ def generar_devoluciones(marca, start_date, end_date, status_placeholder, resour
     with ThreadPoolExecutor(max_workers=6) as ex:
         for res in ex.map(rep.filas_reclamo, reclamos):
             filas.extend(res)
+
+    # Órdenes canceladas después de entregadas = devoluciones aunque no haya reclamo visible
+    cubiertas = {str(f["ORDEN MELI"]) for f in filas}
+    pendientes = [o for o in ordenes if o.get("status") == "cancelled" and str(o["id"]) not in cubiertas]
+    if pendientes:
+        status_placeholder.text(f"{marca}: revisando {len(pendientes)} órdenes canceladas...")
+        ship_ids = sorted({(o.get("shipping") or {}).get("id") for o in pendientes} - {None})
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            envios = dict(zip(ship_ids, ex.map(rep.envio, ship_ids)))
+        contados = set()
+        for o in pendientes:
+            env = envios.get((o.get("shipping") or {}).get("id"), {})
+            if env.get("status_raw") == "not_delivered" or not es_devolucion(rep, o, env):
+                continue
+            cd = o.get("cancel_detail") or {}
+            f_ev = _ts(cd.get("date")) or _ts(o.get("date_last_updated"))
+            if f_ev is not None and desde <= f_ev <= hasta:
+                filas.extend(filas_devolucion_sin_reclamo(rep, o, env, contados))
     return reclamos, filas
 
 
@@ -1069,7 +1128,7 @@ def generar_cancelados(marca, start_date, end_date, status_placeholder):
     """Órdenes canceladas o con envío no entregado cuyo evento ocurrió en el rango.
     Se buscan por fecha de ÚLTIMA ACTUALIZACIÓN (desde el inicio del rango hasta hoy), porque la
     cancelación o la no entrega pasan después de la venta; luego se filtra por la fecha del evento."""
-    rep = MeliReporte(marca, token_vigente(marca))
+    rep = MeliDevoluciones(marca, token_vigente(marca))
     desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
     hasta = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=ZONA_AR)
     ahora = datetime.now(ZONA_AR)
@@ -1098,6 +1157,10 @@ def generar_cancelados(marca, start_date, end_date, status_placeholder):
         no_entregado = env.get("status_raw") == "not_delivered"
         cancelado = o.get("status") == "cancelled"
         if not (no_entregado or cancelado):
+            continue
+        # Si es una devolución (cancelada después de entregada, o con devolución asociada) va al
+        # reporte de Devoluciones, no acá -> evita cargar dos veces la misma NC
+        if not no_entregado and es_devolucion(rep, o, env):
             continue
 
         cd = o.get("cancel_detail") or {}
