@@ -690,9 +690,9 @@ def generar_meli(marca, start_date, end_date, status_placeholder):
 # Flujo: reclamos (claims) del vendedor -> los que tienen devolución -> orden original.
 ESTADO_DEVOLUCION = {
     "pending": "Pendiente",
-    "label_generated": "Devolución preparada",
+    "label_generated": "Devolución en preparación",
     "opened": "Abierta",
-    "ready_to_ship": "Devolución preparada",
+    "ready_to_ship": "Devolución en preparación",
     "shipped": "En camino al vendedor",
     "delivered": "Recibida",
     "not_delivered": "No entregada",
@@ -713,12 +713,12 @@ def _fecha_corta(v):
 
 
 def estado_devolucion(dev):
-    """'Devolución preparada' = etiqueta generada / lista para que el comprador la despache."""
+    """'Devolución en preparación' = el comprador está armando el paquete para enviarlo de regreso."""
     envio = dev.get("shipping") or (dev.get("shipments") or [{}])[0] or {}
     env_st = (envio.get("status") or "").lower()
     st_ = (dev.get("status") or "").lower()
     if st_ in ("opened", "pending", "label_generated") and env_st in ("ready_to_ship", "pending", ""):
-        return "Devolución preparada" if env_st == "ready_to_ship" or st_ == "label_generated" else "Pendiente"
+        return "Devolución en preparación"
     if env_st == "shipped" and st_ not in ("delivered", "closed", "cancelled"):
         return "En camino al vendedor"
     return ESTADO_DEVOLUCION.get(st_, st_ or "S/D")
@@ -734,19 +734,24 @@ def _cache_motivos():
 
 
 class MeliDevoluciones(MeliReporte):
-    def buscar_reclamos(self, desde, hasta, status_placeholder, resource_id=None, campo="date_created"):
-        # MeLi exige al menos un filtro "real": filtramos por la cuenta vendedora (respondent).
-        base = {"players.role": "respondent", "players.user_id": self.tok["user_id"]}
-        if resource_id:
-            base["resource_id"] = resource_id
+    def buscar_reclamos(self, desde, hasta, status_placeholder, resource_id=None, campo="date_created",
+                        resource="order"):
+        # MeLi exige al menos uno de estos pares de filtros:
+        #   [resource + resource_id]  o  [player_role + player_user_id]
+        vendedor = {"player_role": "respondent", "player_user_id": self.tok["user_id"]}
         rango = (f"{campo}:after:{desde.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')},"
                  f"before:{hasta.strftime('%Y-%m-%dT%H:%M:%S.000-03:00')}")
         # Variantes por si MeLi rechaza algún parámetro (se usa la primera que responda 200)
-        variantes = [
-            {**base, "range": rango},
-            base,
-            {"resource_id": resource_id} if resource_id else {"site_id": "MLA", "range": rango},
-        ]
+        if resource_id:
+            variantes = [
+                {"resource": resource, "resource_id": resource_id},
+                {**vendedor, "resource": resource, "resource_id": resource_id},
+            ]
+        else:
+            variantes = [
+                {**vendedor, "range": rango},
+                vendedor,  # sin 'range': se filtra por fecha del lado de la app
+            ]
 
         def fecha_reclamo(c):
             try:
@@ -883,9 +888,20 @@ def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
     ids = {id_txt} | {str(o["id"]) for o in ordenes} | {str(o["pack_id"]) for o in ordenes if o.get("pack_id")}
     hoy = datetime.now(ZONA_AR)
     reclamos = {}
+    ids_orden = {str(o["id"]) for o in ordenes}
+    errores, intentos = [], 0
     for rid in ids:
-        for c in rep.buscar_reclamos(hoy, hoy, status_placeholder, resource_id=rid):
-            reclamos[c["id"]] = c
+        # El reclamo puede estar sobre la orden o sobre el pack/compra
+        tipos = ["order"] if rid in ids_orden else ["purchase", "pack", "order"]
+        for tipo in tipos:
+            intentos += 1
+            try:
+                for c in rep.buscar_reclamos(hoy, hoy, status_placeholder, resource_id=rid, resource=tipo):
+                    reclamos[c["id"]] = c
+            except RuntimeError as e:
+                errores.append(str(e))
+    if not reclamos and errores and len(errores) == intentos:
+        raise RuntimeError(errores[0])
 
     filas, notas = [], []
     if not reclamos:
