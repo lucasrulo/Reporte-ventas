@@ -6,18 +6,123 @@ import time as time_lib
 import io
 import json
 
-# 1. Configuración Minimalista de la página
-st.set_page_config(page_title="Descarga ventas Shopify + MeLi", layout="centered")
+# 1. Configuración de la página + estilo
+st.set_page_config(page_title="Distrinando · Reportes", page_icon="📦", layout="centered")
 
-hide_st_style = """
-            <style>
-            #MainMenu {visibility: hidden;}
-            footer {visibility: hidden;}
-            header {visibility: hidden;}
-            .stButton>button {width: 100%; border-radius: 4px;}
-            </style>
-            """
-st.markdown(hide_st_style, unsafe_allow_html=True)
+ESTILO = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+:root{
+  --violeta:#6D28D9; --violeta-2:#8B5CF6; --indigo:#312E81; --turquesa:#14B8A6;
+  --tinta:#1E1B2E; --gris:#6B6880; --linea:#E7E5F0; --fondo:#F6F5FB; --blanco:#FFFFFF;
+}
+html, body, [class*="css"], .stApp, button, input, textarea { font-family:'Plus Jakarta Sans', sans-serif !important; }
+.stApp { background: radial-gradient(1200px 500px at 10% -10%, #EDE9FE 0%, transparent 60%),
+                     radial-gradient(900px 400px at 110% 0%, #CCFBF1 0%, transparent 55%), var(--fondo); }
+#MainMenu, footer, header { visibility:hidden; }
+.block-container { padding-top:2rem; padding-bottom:4rem; max-width:860px; }
+
+/* ---------- Hero ---------- */
+.hero { position:relative; overflow:hidden; border-radius:28px; padding:2.2rem 2.2rem 1.8rem;
+  background: linear-gradient(135deg, #1E1B4B 0%, #4C1D95 55%, #0F766E 120%); color:#fff;
+  box-shadow: 0 20px 50px -20px rgba(76,29,149,.55); margin-bottom:1.6rem; }
+.hero:before { content:""; position:absolute; width:340px; height:340px; right:-90px; top:-120px;
+  background: radial-gradient(circle, rgba(139,92,246,.75), transparent 65%); filter:blur(10px); }
+.hero:after { content:""; position:absolute; width:260px; height:260px; left:-80px; bottom:-140px;
+  background: radial-gradient(circle, rgba(20,184,166,.55), transparent 65%); filter:blur(8px); }
+.hero .kicker { display:inline-block; font-size:.75rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase;
+  background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.25); padding:.3rem .75rem; border-radius:999px; }
+.hero h1 { color:#fff !important; font-size:2.35rem; line-height:1.1; font-weight:800; margin:.9rem 0 .5rem; color:#fff; letter-spacing:-.02em; }
+.hero h1 span { background:linear-gradient(90deg,#C4B5FD,#5EEAD4); -webkit-background-clip:text; background-clip:text; color:transparent; }
+.hero p { color:rgba(255,255,255,.82); font-size:1rem; margin:0; max-width:560px; }
+.hero .chips { display:flex; gap:.5rem; flex-wrap:wrap; margin-top:1.2rem; position:relative; z-index:1; }
+.hero .chip { font-size:.8rem; font-weight:600; padding:.35rem .8rem; border-radius:999px;
+  background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.22); color:#fff; }
+.hero .chip b { color:#5EEAD4; }
+
+/* ---------- Pasos ---------- */
+.paso { display:flex; align-items:center; gap:.7rem; margin:.2rem 0 .6rem; }
+.paso .num { width:30px; height:30px; border-radius:10px; display:grid; place-items:center; font-weight:800; font-size:.9rem;
+  color:#fff; background:linear-gradient(135deg,var(--violeta),var(--turquesa)); box-shadow:0 6px 14px -6px rgba(109,40,217,.7); }
+.paso .tit { font-weight:700; color:var(--tinta); font-size:1.02rem; }
+.paso .sub { color:var(--gris); font-size:.82rem; }
+
+/* Tarjetas (st.container(border=True)) */
+div[data-testid="stVerticalBlockBorderWrapper"] { background:var(--blanco); border:1px solid var(--linea) !important;
+  border-radius:22px !important; box-shadow:0 10px 30px -18px rgba(30,27,46,.25); }
+
+/* ---------- Radios como pastillas (compatible con versiones nuevas y viejas de Streamlit) ---------- */
+div[data-testid="stRadio"] [role="radiogroup"] { gap:.5rem !important; flex-wrap:wrap; }
+[data-testid="stRadioOption"], div[data-testid="stRadio"] [role="radiogroup"] > label {
+  margin:0 !important; padding:.55rem 1.05rem !important; border-radius:14px; background:var(--fondo);
+  border:1.5px solid var(--linea); cursor:pointer; transition:all .18s ease; }
+[data-testid="stRadioOption"]:hover { border-color:var(--violeta-2); transform:translateY(-1px); }
+[data-testid="stRadioOption"] > div > div:first-child:not([data-testid]),
+div[data-testid="stRadio"] [role="radiogroup"] > label > div:first-child:not([data-testid]) { display:none !important; }
+[data-testid="stRadioOption"] p { font-weight:600; color:var(--tinta); font-size:.92rem; }
+[data-testid="stRadioOption"][data-selected="true"], [data-testid="stRadioOption"]:has(input:checked),
+div[data-testid="stRadio"] [role="radiogroup"] > label:has(input:checked) {
+  background:linear-gradient(135deg,var(--violeta),#4F46E5) !important; border-color:transparent;
+  box-shadow:0 10px 20px -10px rgba(79,70,229,.8); }
+[data-testid="stRadioOption"][data-selected="true"] p, [data-testid="stRadioOption"]:has(input:checked) p { color:#fff !important; }
+
+/* ---------- Inputs ---------- */
+div[data-baseweb="input"], div[data-baseweb="select"] > div, div[data-baseweb="textarea"] {
+  border-radius:14px !important; border-color:var(--linea) !important; background:var(--fondo) !important; }
+span[data-baseweb="tag"] { background:#EDE9FE !important; border-radius:999px !important; }
+span[data-baseweb="tag"] span { color:#5B21B6 !important; font-weight:600; }
+span[data-baseweb="tag"] svg { fill:#7C3AED !important; }
+label[data-testid="stWidgetLabel"] p { font-weight:600; color:var(--tinta); }
+
+/* ---------- Botones ---------- */
+.stButton > button, .stLinkButton > a { border-radius:12px !important; font-weight:600 !important;
+  border:1.5px solid var(--linea) !important; background:var(--blanco) !important; color:var(--tinta) !important;
+  transition:all .18s ease; }
+.stButton > button:hover, .stLinkButton > a:hover { border-color:var(--violeta-2) !important; color:var(--violeta) !important; }
+.stButton > button[kind="primary"], button[data-testid="stBaseButton-primary"] { width:100%; padding:.95rem 1rem !important; font-size:1.05rem !important; font-weight:700 !important;
+  color:#fff !important; border:none !important; border-radius:16px !important;
+  background:linear-gradient(110deg,#6D28D9 0%,#4F46E5 45%,#0D9488 100%) !important; background-size:200% 100% !important;
+  box-shadow:0 18px 30px -16px rgba(79,70,229,.9); }
+.stButton > button[kind="primary"]:hover, button[data-testid="stBaseButton-primary"]:hover { background-position:100% 0 !important; transform:translateY(-1px); color:#fff !important; }
+div[data-testid="stDownloadButton"] button { width:100%; padding:.95rem 1rem; border-radius:16px; border:none;
+  font-weight:700; font-size:1.05rem; color:#0B3B36; background:linear-gradient(110deg,#5EEAD4,#A7F3D0);
+  box-shadow:0 16px 28px -16px rgba(13,148,136,.9); }
+div[data-testid="stDownloadButton"] button:hover { color:#0B3B36; filter:brightness(1.04); transform:translateY(-1px); }
+
+button[data-testid="stBaseButton-primary"] p, div[data-testid="stDownloadButton"] button p { font-weight:700 !important; font-size:1.05rem !important; }
+.hero h1, .hero h1 * { color:#fff; }
+.hero h1 span { color:transparent !important; }
+
+/* Botones de atajos de fecha (más chicos) */
+[class*="st-key-atajo_"] button { padding:.3rem .2rem !important; font-size:.8rem !important; border-radius:999px !important; }
+
+/* ---------- Expanders, alerts, progreso ---------- */
+div[data-testid="stExpander"] details { border-radius:18px !important; border:1px solid var(--linea) !important; background:var(--blanco); }
+div[data-testid="stExpander"] summary p { font-weight:600; }
+div[data-testid="stAlert"] { border-radius:16px; }
+div[data-testid="stProgress"] div[role="progressbar"] > div > div { background:linear-gradient(90deg,#8B5CF6,#14B8A6) !important; }
+
+/* ---------- KPIs y resultados ---------- */
+.kpis { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.8rem; margin:1rem 0 1.1rem; }
+@media (max-width:640px){ .kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); } .hero h1{font-size:1.8rem;} }
+.kpi { background:var(--blanco); border:1px solid var(--linea); border-radius:20px; padding:1rem 1.1rem;
+  box-shadow:0 10px 24px -18px rgba(30,27,46,.35); }
+.kpi .lbl { font-size:.75rem; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--gris); }
+.kpi .val { font-size:1.45rem; font-weight:800; color:var(--tinta); margin-top:.2rem; letter-spacing:-.02em; }
+.kpi.destacado { background:linear-gradient(135deg,#1E1B4B,#4C1D95); border:none; }
+.kpi.destacado .lbl { color:rgba(255,255,255,.7); } .kpi.destacado .val { color:#fff; }
+.listo { display:flex; align-items:center; gap:.7rem; padding:.9rem 1.1rem; border-radius:18px;
+  background:linear-gradient(90deg,#ECFDF5,#F0FDFA); border:1px solid #A7F3D0; color:#065F46; font-weight:600; margin-top:1rem; }
+.marcas-res { display:flex; flex-wrap:wrap; gap:.45rem; margin:.6rem 0 0; }
+.marca-res { font-size:.8rem; padding:.35rem .75rem; border-radius:999px; background:var(--blanco); border:1px solid var(--linea); color:var(--tinta); }
+.marca-res.ok:before { content:"●"; color:#10B981; margin-right:.4rem; }
+.marca-res.err:before { content:"●"; color:#EF4444; margin-right:.4rem; }
+.cuenta { display:flex; align-items:center; gap:.6rem; font-weight:600; color:var(--tinta); }
+.cuenta .dot { width:10px; height:10px; border-radius:50%; }
+</style>
+"""
+st.markdown(ESTILO, unsafe_allow_html=True)
 
 try:
     STORES = st.secrets["stores"]
@@ -1192,23 +1297,77 @@ def generar_cancelados(marca, start_date, end_date, status_placeholder):
     return candidatas, filas
 
 
-def descargar_excel(df, nombre_hoja, file_name, start_time):
+def _pesos(x):
+    try:
+        return "$ " + f"{float(x):,.0f}".replace(",", ".")
+    except Exception:
+        return "$ 0"
+
+
+def _miles(x):
+    return f"{int(x):,}".replace(",", ".")
+
+
+def calcular_kpis(df, tipo):
+    """Cuatro indicadores para mostrar arriba de la descarga, según el tipo de reporte."""
+    def col(c):
+        return df[c] if c in df.columns else pd.Series(dtype=float)
+
+    marcas = col("MARCA").nunique()
+    if tipo == "shopify":
+        pedidos = col("PEDIDO").nunique()
+        unidades = pd.to_numeric(col("CANTIDAD"), errors="coerce").sum()
+        total = (df.drop_duplicates(["MARCA", "PEDIDO"])["TOTAL PEDIDO"].sum()
+                 if {"MARCA", "PEDIDO", "TOTAL PEDIDO"} <= set(df.columns) else 0)
+        return [("Facturación", _pesos(total), True), ("Pedidos", _miles(pedidos), False),
+                ("Unidades", _miles(unidades), False), ("Marcas", _miles(marcas), False)]
+    pedidos = col("PACK ID").nunique()
+    unidades = pd.to_numeric(col("CANTIDAD"), errors="coerce").sum()
+    valor = pd.to_numeric(col("VALOR ARTICULO"), errors="coerce").sum()
+    if tipo == "ventas":
+        total = valor + pd.to_numeric(col("IMPORTE DEL ENVIO"), errors="coerce").sum()
+        return [("Facturación", _pesos(total), True), ("Pedidos", _miles(pedidos), False),
+                ("Unidades", _miles(unidades), False), ("Marcas", _miles(marcas), False)]
+    reemb = pd.to_numeric(col("ANULACIONES Y REEMBOLSOS"), errors="coerce").sum()
+    etiqueta = "Devoluciones" if tipo == "devoluciones" else "Casos"
+    return [("Valor de mercadería", _pesos(valor), True), (etiqueta, _miles(pedidos), False),
+            ("Unidades", _miles(unidades), False), ("Reembolsado", _pesos(reemb), False)]
+
+
+def descargar_excel(df, nombre_hoja, file_name, start_time, tipo="ventas"):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=nombre_hoja)
 
     elapsed = time_lib.time() - start_time
-    st.success(f"Reporte procesado en {elapsed:.0f} segundos.")
-
-    with st.expander("Ver vista previa"):
-        st.dataframe(df.head(50), use_container_width=True)
+    st.markdown(f'<div class="listo">✨ Reporte listo en {elapsed:.0f} segundos · {_miles(len(df))} filas</div>',
+                unsafe_allow_html=True)
+    kpis = calcular_kpis(df, tipo)
+    st.markdown('<div class="kpis">' + "".join(
+        f'<div class="kpi{" destacado" if dest else ""}"><div class="lbl">{lbl}</div><div class="val">{val}</div></div>'
+        for lbl, val, dest in kpis) + "</div>", unsafe_allow_html=True)
 
     st.download_button(
-        label="Descargar Archivo",
+        label=f"⬇️  Descargar Excel  ·  {file_name}",
         data=output.getvalue(),
         file_name=file_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
     )
+    with st.expander("👀 Vista previa (primeras 50 filas)"):
+        st.dataframe(df.head(50), use_container_width=True, hide_index=True)
+
+
+def paso(n, titulo, sub=""):
+    st.markdown(f'<div class="paso"><div class="num">{n}</div><div><div class="tit">{titulo}</div>'
+                f'<div class="sub">{sub}</div></div></div>', unsafe_allow_html=True)
+
+
+def chips_marcas(resultados):
+    if resultados:
+        st.markdown('<div class="marcas-res">' + "".join(
+            f'<span class="marca-res {"ok" if ok else "err"}">{txt}</span>' for ok, txt in resultados) + "</div>",
+            unsafe_allow_html=True)
 
 
 # ---------- Vuelta del login de MeLi (?code=...&state=Marca) ----------
@@ -1226,63 +1385,113 @@ if "code" in _qp and "state" in _qp and not MELI_FALTANTES:
 
 
 # --- Interfaz de Usuario ---
-st.title("Consolidador de Ventas")
-st.write("---")
+conectadas = {}
+if not MELI_FALTANTES:
+    try:
+        _estado_tk = _estado_tokens()
+        with _estado_tk["lock"]:
+            conectadas = dict(_cargar_tokens(_estado_tk))
+    except Exception:
+        conectadas = {}
 
-canal = st.radio("Canal", ["Shopify", "MercadoLibre"], horizontal=True)
+st.markdown(f"""
+<div class="hero">
+  <span class="kicker">Distrinando · E-commerce</span>
+  <h1>Tus ventas, <span>en un clic.</span></h1>
+  <p>Ventas, devoluciones y cancelaciones de Shopify y MercadoLibre, listas para cargar en SAP.</p>
+  <div class="chips">
+    <span class="chip">🛍️ Shopify · <b>{len(STORES)}</b> tiendas</span>
+    <span class="chip">🤝 MercadoLibre · <b>{len(conectadas)}/{len(MELI_CUENTAS)}</b> cuentas</span>
+    <span class="chip">📊 Excel listo para ERP</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-if canal == "MercadoLibre":
-    if MELI_FALTANTES:
-        st.error("Faltan en los secrets, sección [meli]: " + ", ".join(MELI_FALTANTES))
-        if "fernet_key" in MELI_FALTANTES:
-            st.caption("fernet_key: podés usar esta (generada recién, copiala a los secrets):")
-            st.code(Fernet.generate_key().decode())
-        st.stop()
+# ---- Paso 1: canal y tipo de reporte ----
+with st.container(border=True):
+    paso(1, "¿Qué querés descargar?", "Elegí el canal y el tipo de reporte")
+    canal = st.radio("Canal", ["🛍️ Shopify", "🤝 MercadoLibre"], horizontal=True, label_visibility="collapsed")
+    canal = "Shopify" if "Shopify" in canal else "MercadoLibre"
 
-    with st.expander("⚙️ Cuentas de MercadoLibre"):
-        st.caption("Para conectar: iniciá sesión en mercadolibre.com.ar con la cuenta de esa marca "
-                   "en este navegador y tocá su botón. Se hace una sola vez por cuenta.")
-        try:
-            estado_tk = _estado_tokens()
-            with estado_tk["lock"]:
-                conectadas = dict(_cargar_tokens(estado_tk))
-        except Exception as e:
-            conectadas = {}
-            st.error(str(e))
-        for m in MELI_CUENTAS:
-            c1, c2 = st.columns([3, 2])
-            info = conectadas.get(m)
-            c1.write(f"**{m}** — " + (f"✅ {info.get('nickname') or info.get('user_id')}" if info else "❌ sin conectar"))
-            url = f"{MELI_AUTH}?" + urlencode({"response_type": "code", "client_id": MELI_APP_ID,
-                                               "redirect_uri": MELI_REDIRECT, "state": m})
-            c2.link_button("Reconectar" if info else "Conectar", url)
+    tipo_meli = "Ventas"
+    campo_dev = "date_created"
+    if canal == "MercadoLibre":
+        if MELI_FALTANTES:
+            st.error("Faltan en los secrets, sección [meli]: " + ", ".join(MELI_FALTANTES))
+            if "fernet_key" in MELI_FALTANTES:
+                st.caption("fernet_key: podés usar esta (generada recién, copiala a los secrets):")
+                st.code(Fernet.generate_key().decode())
+            st.stop()
 
-tipo_meli = "Ventas"
-campo_dev = "date_created"
-if canal == "MercadoLibre":
-    tipo_meli = st.radio("Reporte", ["Ventas", "Devoluciones", "Cancelados / No entregados"], horizontal=True)
-    if tipo_meli == "Cancelados / No entregados":
-        st.caption("Trae las ventas pagadas que se cancelaron o cuyo envío no se entregó, "
-                   "cuando la cancelación / no entrega ocurrió dentro del rango de fechas.")
-    if tipo_meli == "Devoluciones":
-        fecha_dev = st.radio("Filtrar devoluciones por", ["Fecha de apertura del reclamo", "Última actualización"],
-                             horizontal=True,
-                             help="'Última actualización' incluye reclamos abiertos antes del rango que "
-                                  "tuvieron movimiento dentro del rango (ej. la devolución se preparó o llegó).")
-        campo_dev = "date_created" if fecha_dev.startswith("Fecha de apertura") else "last_updated"
+        opciones_tipo = {"💰 Ventas": "Ventas", "↩️ Devoluciones": "Devoluciones",
+                         "🚫 Cancelados / No entregados": "Cancelados / No entregados"}
+        tipo_meli = opciones_tipo[st.radio("Reporte", list(opciones_tipo), horizontal=True,
+                                           label_visibility="collapsed")]
+        if tipo_meli == "Cancelados / No entregados":
+            st.caption("Ventas pagadas que se cancelaron antes de entregarse o cuyo envío no llegó al comprador, "
+                       "según la fecha en que pasó.")
+        if tipo_meli == "Devoluciones":
+            st.caption("Filtrar devoluciones por:")
+            fecha_dev = st.radio("Filtrar devoluciones por", ["📬 Apertura del reclamo", "🔄 Última actualización"],
+                                 horizontal=True, label_visibility="collapsed")
+            campo_dev = "date_created" if "Apertura" in fecha_dev else "last_updated"
+            st.caption("'Última actualización' suma reclamos abiertos antes que tuvieron movimiento en el rango "
+                       "(se preparó, llegó o se reembolsó).")
 
-col1, col2 = st.columns(2)
-with col1:
-    date_range = st.date_input("Rango de Fechas", [])
-with col2:
-    available_brands = list(STORES.keys()) if canal == "Shopify" else MELI_CUENTAS
-    selected_brands = st.multiselect("Marcas", available_brands, default=available_brands, key=f"marcas_{canal}")
+        with st.expander(f"⚙️ Cuentas de MercadoLibre · {len(conectadas)}/{len(MELI_CUENTAS)} conectadas"):
+            st.caption("Para conectar: iniciá sesión en mercadolibre.com.ar con la cuenta de esa marca "
+                       "en este navegador y tocá su botón. Se hace una sola vez por cuenta.")
+            for m in MELI_CUENTAS:
+                c1, c2 = st.columns([3, 2])
+                info = conectadas.get(m)
+                color = "#10B981" if info else "#EF4444"
+                detalle = (info.get("nickname") or info.get("user_id")) if info else "sin conectar"
+                c1.markdown(f'<div class="cuenta"><span class="dot" style="background:{color}"></span>{m}'
+                            f'<span style="color:#6B6880;font-weight:500">· {detalle}</span></div>',
+                            unsafe_allow_html=True)
+                url = f"{MELI_AUTH}?" + urlencode({"response_type": "code", "client_id": MELI_APP_ID,
+                                                   "redirect_uri": MELI_REDIRECT, "state": m})
+                c2.link_button("Reconectar" if info else "Conectar", url, use_container_width=True)
+
+# ---- Paso 2: período y marcas ----
+hoy_ar = datetime.now(ZONA_AR).date()
+if "rango_fechas" not in st.session_state:
+    st.session_state["rango_fechas"] = ()
+
+
+def _set_rango(d0, d1):
+    st.session_state["rango_fechas"] = (d0, d1)
+
+
+_ini_mes = hoy_ar.replace(day=1)
+_fin_mes_ant = _ini_mes - timedelta(days=1)
+ATAJOS = [
+    ("Hoy", hoy_ar, hoy_ar),
+    ("Ayer", hoy_ar - timedelta(days=1), hoy_ar - timedelta(days=1)),
+    ("7 días", hoy_ar - timedelta(days=6), hoy_ar),
+    ("Este mes", _ini_mes, hoy_ar),
+    ("Mes pasado", _fin_mes_ant.replace(day=1), _fin_mes_ant),
+]
+
+with st.container(border=True):
+    paso(2, "¿De qué período y marcas?", "Usá un atajo o elegí las fechas a mano")
+    cols_at = st.columns(len(ATAJOS))
+    for c, (txt, d0, d1) in zip(cols_at, ATAJOS):
+        c.button(txt, key=f"atajo_{txt}", on_click=_set_rango, args=(d0, d1), use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        date_range = st.date_input("📅 Rango de fechas", key="rango_fechas", format="DD/MM/YYYY")
+    with col2:
+        available_brands = list(STORES.keys()) if canal == "Shopify" else MELI_CUENTAS
+        selected_brands = st.multiselect("🏷️ Marcas", available_brands, default=available_brands,
+                                         key=f"marcas_{canal}")
 
 if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
     with st.expander("🔎 Buscar devoluciones de packs / órdenes puntuales"):
         ids_txt = st.text_area("Pack IDs u órdenes de MeLi (uno por línea)", key="ids_dev", height=100)
         ver_tecnico = st.checkbox("Mostrar datos técnicos (para diagnóstico)", key="tec_dev")
-        if st.button("Buscar") and ids_txt.strip():
+        if st.button("Buscar", key="btn_buscar_dev") and ids_txt.strip():
             ph = st.empty()
             rango_sel = date_range if len(date_range) == 2 else None
             filas_b = []
@@ -1311,20 +1520,24 @@ if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
             ph.empty()
             if filas_b:
                 df_b = pd.DataFrame(filas_b)
-                st.dataframe(df_b[[c for c in COLUMNAS_DEVOLUCION if c in df_b.columns]], use_container_width=True)
+                st.dataframe(df_b[[c for c in COLUMNAS_DEVOLUCION if c in df_b.columns]],
+                             use_container_width=True, hide_index=True)
 
 st.write("")
-
-if st.button("Generar Reporte", type="primary"):
+_txt_boton = {"Ventas": "Generar reporte de ventas", "Devoluciones": "Generar reporte de devoluciones",
+              "Cancelados / No entregados": "Generar reporte de cancelados"}
+if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Generar reporte de Shopify'}",
+             type="primary", use_container_width=True):
     if canal == "Shopify" and not STORES:
         st.error("Credenciales de Shopify no configuradas en st.secrets.")
     elif len(date_range) != 2:
-        st.warning("Seleccioná fecha de inicio y fin.")
+        st.warning("📅 Elegí fecha de inicio y fin (o usá un atajo).")
     elif not selected_brands:
-        st.warning("Seleccioná al menos una marca.")
+        st.warning("🏷️ Elegí al menos una marca.")
     else:
         start_date, end_date = date_range
         all_data = []
+        resultados = []
         start_time = time_lib.time()
         progress_bar = st.progress(0)
         status_placeholder = st.empty()
@@ -1349,12 +1562,9 @@ if st.button("Generar Reporte", type="primary"):
                     orders = build_orders_from_bulk(raw_rows)
                     processed_rows = process_orders_bulk(orders, marca)
                     all_data.extend(processed_rows)
-
-                    st.caption(
-                        f"🔍 {marca}: {len(raw_rows)} objetos descargados del bulk, "
-                        f"{len(orders)} pedidos reconocidos, {len(processed_rows)} filas generadas."
-                    )
+                    resultados.append((True, f"{marca} · {len(orders)} pedidos"))
                 except RuntimeError as e:
+                    resultados.append((False, f"{marca} · error"))
                     st.error(f"{marca}: error durante la exportación — {e}")
 
                 progress_bar.progress((i + 1) / len(selected_brands))
@@ -1365,42 +1575,46 @@ if st.button("Generar Reporte", type="primary"):
                     status_placeholder.text(f"{marca}: verificando token...")
                     if tipo_meli == "Ventas":
                         ordenes, filas = generar_meli(marca, start_date, end_date, status_placeholder)
-                        st.caption(f"🔍 {marca}: {len(ordenes)} órdenes, {len(filas)} filas generadas.")
+                        resultados.append((True, f"{marca} · {len(ordenes)} órdenes"))
                     elif tipo_meli == "Devoluciones":
                         reclamos, filas = generar_devoluciones(marca, start_date, end_date, status_placeholder,
                                                                campo=campo_dev)
-                        st.caption(f"🔍 {marca}: {len(reclamos)} reclamos revisados, {len(filas)} filas de devolución.")
+                        resultados.append((True, f"{marca} · {len(filas)} filas"))
                     else:
                         candidatas, filas = generar_cancelados(marca, start_date, end_date, status_placeholder)
-                        st.caption(f"🔍 {marca}: {len(candidatas)} órdenes revisadas, {len(filas)} filas canceladas / no entregadas.")
+                        resultados.append((True, f"{marca} · {len(filas)} filas"))
                     all_data.extend(filas)
                 except Exception as e:
+                    resultados.append((False, f"{marca} · error"))
                     st.error(f"{marca}: error durante la exportación — {e}")
 
                 progress_bar.progress((i + 1) / len(selected_brands))
 
         progress_bar.empty()
         status_placeholder.empty()
+        chips_marcas(resultados)
 
         if all_data:
             df = pd.DataFrame(all_data)
             if canal == "Shopify":
-                descargar_excel(df, "Ventas", f"Reporte_{start_date}_al_{end_date}.xlsx", start_time)
+                descargar_excel(df, "Ventas", f"Reporte_{start_date}_al_{end_date}.xlsx", start_time, "shopify")
             elif tipo_meli == "Ventas":
                 df = df.drop(columns=["_item_id", "_unit_price"], errors="ignore")
-                descargar_excel(df, "Ventas MeLi", f"Reporte_MeLi_{start_date}_al_{end_date}.xlsx", start_time)
+                descargar_excel(df, "Ventas MeLi", f"Reporte_MeLi_{start_date}_al_{end_date}.xlsx", start_time,
+                                "ventas")
             elif tipo_meli == "Devoluciones":
                 df = df[[c for c in COLUMNAS_DEVOLUCION if c in df.columns]]
                 descargar_excel(df, "Devoluciones MeLi",
-                                f"Devoluciones_MeLi_{start_date}_al_{end_date}.xlsx", start_time)
+                                f"Devoluciones_MeLi_{start_date}_al_{end_date}.xlsx", start_time, "devoluciones")
             else:
                 df = df[[c for c in COLUMNAS_CANCELADOS if c in df.columns]]
                 descargar_excel(df, "Cancelados MeLi",
-                                f"Cancelados_NoEntregados_MeLi_{start_date}_al_{end_date}.xlsx", start_time)
+                                f"Cancelados_NoEntregados_MeLi_{start_date}_al_{end_date}.xlsx", start_time,
+                                "cancelados")
         else:
             que = "ventas"
             if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
                 que = "devoluciones"
             elif canal == "MercadoLibre" and tipo_meli != "Ventas":
                 que = "cancelaciones ni envíos no entregados"
-            st.info(f"No se registraron {que} en el período seleccionado.")
+            st.info(f"🌤️ No se registraron {que} en el período seleccionado.")
