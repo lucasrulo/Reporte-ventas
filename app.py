@@ -596,6 +596,7 @@ class MeliReporte:
         if r is not None and r.status_code == 200:
             s = r.json()
             out["estado_envio"] = estado_envio_meli(s.get("status"), s.get("substatus"))
+            out["tracking"] = str(s.get("tracking_number") or "")
             out["status_raw"] = (s.get("status") or "").lower()
             out["substatus_raw"] = (s.get("substatus") or "").lower()
             hist = s.get("status_history") or {}
@@ -657,6 +658,7 @@ class MeliReporte:
                 "COSTO ENVIO VENDEDOR": (env.get("costo_vendedor", 0.0)
                                          if primera and shipping_id and shipping_id not in envio_ya_contado else 0.0),
                 "ANULACIONES Y REEMBOLSOS": reembolso if primera else 0.0,
+                "NUMERO DE SEGUIMIENTO": env.get("tracking", "") if shipping_id else "",
                 "_item_id": str(item.get("id") or ""),
                 "_unit_price": num(oi.get("unit_price")),
             })
