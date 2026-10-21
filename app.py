@@ -1000,6 +1000,9 @@ class MeliDevoluciones(MeliReporte):
         filas, contados = [], set()
         for o in ordenes:
             env = self.envio((o.get("shipping") or {}).get("id"))
+            if no_fue_entregado(o, env):
+                # El paquete nunca llegó al comprador: no es devolución, va a "Cancelados / No entregados"
+                continue
             for f in self.a_filas(o, env, contados):
                 if cant_dev and f["_item_id"] not in cant_dev:
                     continue  # devolución parcial: ese ítem no se devolvió
@@ -1100,7 +1103,10 @@ def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
         txt = (f"Reclamo {c['id']} ({c.get('reason_id', '')}): abierto el "
                f"{abierto.strftime('%d/%m/%Y') if abierto is not None else '?'}, última actualización "
                f"{actualizado.strftime('%d/%m/%Y') if actualizado is not None else '?'}.")
-        if not fr:
+        if not fr and any(no_fue_entregado(o, rep.envio((o.get("shipping") or {}).get("id"))) for o in ordenes):
+            txt += (" El envío figura como **no entregado** (el paquete nunca llegó al comprador): no es una "
+                    "devolución → aparece en el reporte **Cancelados / No entregados**.")
+        elif not fr:
             txt += " **No tiene devolución asociada** (es una mediación/reclamo sin envío de vuelta)."
         elif rango:
             d0 = datetime.combine(rango[0], datetime.min.time()).replace(tzinfo=ZONA_AR)
@@ -1113,6 +1119,11 @@ def diagnosticar_devolucion(marca, id_txt, rango, status_placeholder):
         notas.append(txt)
         filas.extend(fr)
     return filas, notas, tecnico
+
+
+def no_fue_entregado(o, env):
+    """El paquete no llegó al comprador (vuelve o volvió al vendedor sin entregarse)."""
+    return env.get("status_raw") == "not_delivered" or "not_delivered" in (o.get("tags") or [])
 
 
 def es_devolucion(rep, o, env):
@@ -1189,7 +1200,7 @@ def generar_devoluciones(marca, start_date, end_date, status_placeholder, resour
         contados = set()
         for o in pendientes:
             env = envios.get((o.get("shipping") or {}).get("id"), {})
-            if env.get("status_raw") == "not_delivered" or not es_devolucion(rep, o, env):
+            if no_fue_entregado(o, env) or not es_devolucion(rep, o, env):
                 continue
             cd = o.get("cancel_detail") or {}
             f_ev = _ts(cd.get("date")) or _ts(o.get("date_last_updated"))
@@ -1261,7 +1272,7 @@ def generar_cancelados(marca, start_date, end_date, status_placeholder):
     for o in sorted(candidatas, key=lambda x: x.get("date_created", "")):
         sid = (o.get("shipping") or {}).get("id")
         env = envios.get(sid, {})
-        no_entregado = env.get("status_raw") == "not_delivered"
+        no_entregado = no_fue_entregado(o, env)
         cancelado = o.get("status") == "cancelled"
         if not (no_entregado or cancelado):
             continue
