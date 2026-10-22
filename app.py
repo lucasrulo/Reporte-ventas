@@ -702,6 +702,9 @@ class MeliReporte:
             s = r.json()
             out["estado_envio"] = estado_envio_meli(s.get("status"), s.get("substatus"))
             out["tracking"] = str(s.get("tracking_number") or "")
+            opcion = s.get("shipping_option") or {}
+            out["costo_opcion"] = num(opcion.get("cost"))
+            out["_raw_opcion"] = {k: opcion.get(k) for k in ("cost", "list_cost", "currency_id", "name")}
             out["status_raw"] = (s.get("status") or "").lower()
             out["substatus_raw"] = (s.get("substatus") or "").lower()
             hist = s.get("status_history") or {}
@@ -710,6 +713,7 @@ class MeliReporte:
         c = self.get(f"/shipments/{shipping_id}/costs")
         if c is not None and c.status_code == 200:
             cj = c.json()
+            out["_raw_costs"] = cj
             senders = cj.get("senders") or []
             out["costo_vendedor"] = sum(num(x.get("cost")) for x in senders)
             # Lo que pagó el comprador por el envío (en ME2 no siempre viene en el pago)
@@ -725,11 +729,8 @@ class MeliReporte:
         aprobados = [p for p in pagos if p.get("status") in ("approved", "refunded", "charged_back", "partially_refunded")]
         id_pago = ", ".join(str(p.get("id")) for p in (aprobados or pagos) if p.get("id"))
 
-        envio_comprador = sum(num(p.get("shipping_cost")) for p in aprobados)
         shipping_id = (o.get("shipping") or {}).get("id")
-        if not envio_comprador and shipping_id and shipping_id not in envio_ya_contado:
-            # Respaldo: costo del envío que figura para el comprador en /shipments/{id}/costs
-            envio_comprador = env.get("costo_comprador", 0.0)
+        envio_comprador = importe_envio_comprador(o, env, shipping_id, envio_ya_contado)
 
         reembolso = 0.0
         for p in pagos:
@@ -772,6 +773,21 @@ class MeliReporte:
         return filas
 
 
+def importe_envio_comprador(o, env, shipping_id, envio_ya_contado):
+    """Lo que pagó el comprador por el envío. Va UNA sola vez por envío (un pack = un envío).
+    Fuentes, en orden: pagos de todas las órdenes del envío -> shipping_cost de la orden ->
+    costo del receptor en /shipments/{id}/costs -> costo de la opción de envío elegida."""
+    pagos = [p for p in (o.get("payments") or []) if p and p.get("status") in
+             ("approved", "refunded", "charged_back", "partially_refunded")]
+    pagos_orden = sum(num(p.get("shipping_cost")) for p in pagos)
+    if not shipping_id:
+        return pagos_orden
+    if shipping_id in envio_ya_contado:
+        return 0.0
+    return (env.get("pagos_envio_total", pagos_orden) or num(o.get("shipping_cost"))
+            or env.get("costo_comprador", 0.0) or env.get("costo_opcion", 0.0))
+
+
 def generar_meli(marca, start_date, end_date, status_placeholder):
     rep = MeliReporte(marca, token_vigente(marca))
     desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
@@ -786,11 +802,61 @@ def generar_meli(marca, start_date, end_date, status_placeholder):
         for sid, env in zip(ship_ids, ex.map(rep.envio, ship_ids)):
             envios[sid] = env
 
+    # Envío pagado por el comprador sumando los pagos de TODAS las órdenes del mismo envío
+    for o in ordenes:
+        sid = (o.get("shipping") or {}).get("id")
+        if sid in envios:
+            pagos = [p for p in (o.get("payments") or []) if p and p.get("status") in
+                     ("approved", "refunded", "charged_back", "partially_refunded")]
+            envios[sid]["pagos_envio_total"] = (envios[sid].get("pagos_envio_total", 0.0)
+                                                + sum(num(p.get("shipping_cost")) for p in pagos))
+
     filas, contados = [], set()
     for o in sorted(ordenes, key=lambda x: x.get("date_created", "")):
         sid = (o.get("shipping") or {}).get("id")
         filas.extend(rep.a_filas(o, envios.get(sid, {}), contados))
     return ordenes, filas
+
+
+def diagnosticar_envio(marca, id_txt):
+    """Muestra de dónde sale (o por qué no sale) el importe del envío de un pack u orden."""
+    rep = MeliDevoluciones(marca, token_vigente(marca))
+    ordenes = rep.ordenes_de(None, id_txt)
+    if not ordenes:
+        return None
+    detalle, envios = [], {}
+    for o in ordenes:
+        sid = (o.get("shipping") or {}).get("id")
+        if sid and sid not in envios:
+            envios[sid] = rep.envio(sid)
+        detalle.append({
+            "orden": o.get("id"), "pack": o.get("pack_id"), "envio_id": sid,
+            "total_orden": o.get("total_amount"), "shipping_cost_orden": o.get("shipping_cost"),
+            "pagos": [{k: p.get(k) for k in ("id", "status", "transaction_amount", "shipping_cost",
+                                              "total_paid_amount", "coupon_amount")}
+                      for p in (o.get("payments") or []) if p],
+        })
+    for sid, env in envios.items():
+        env["pagos_envio_total"] = sum(
+            num(p.get("shipping_cost")) for o in ordenes if (o.get("shipping") or {}).get("id") == sid
+            for p in (o.get("payments") or []) if p and p.get("status") in
+            ("approved", "refunded", "charged_back", "partially_refunded"))
+    contados, filas = set(), []
+    for o in ordenes:
+        sid = (o.get("shipping") or {}).get("id")
+        filas.extend(rep.a_filas(o, envios.get(sid, {}), contados))
+    resumen = {
+        "IMPORTE DEL ENVIO que sale en el reporte": sum(f["IMPORTE DEL ENVIO"] for f in filas),
+        "COSTO ENVIO VENDEDOR": sum(f["COSTO ENVIO VENDEDOR"] for f in filas),
+        "VALOR ARTICULOS": sum(f["VALOR ARTICULO"] for f in filas),
+    }
+    crudo = {"ordenes": detalle,
+             "envios": {str(k): {"costo_comprador(costs.receiver)": v.get("costo_comprador"),
+                                 "costo_opcion(shipping_option)": v.get("costo_opcion"),
+                                 "pagos_envio_total": v.get("pagos_envio_total"),
+                                 "shipping_option": v.get("_raw_opcion"), "costs": v.get("_raw_costs")}
+                        for k, v in envios.items()}}
+    return resumen, crudo
 
 
 # ---------- Devoluciones ----------
@@ -1336,7 +1402,10 @@ def calcular_kpis(df, tipo):
     unidades = pd.to_numeric(col("CANTIDAD"), errors="coerce").sum()
     valor = pd.to_numeric(col("VALOR ARTICULO"), errors="coerce").sum()
     if tipo == "ventas":
-        total = valor + pd.to_numeric(col("IMPORTE DEL ENVIO"), errors="coerce").sum()
+        # El envío se repite en cada fila del pack: se cuenta una sola vez por pack
+        envio = (pd.to_numeric(df.drop_duplicates(["MARCA", "PACK ID"])["IMPORTE DEL ENVIO"], errors="coerce").sum()
+                 if {"MARCA", "PACK ID", "IMPORTE DEL ENVIO"} <= set(df.columns) else 0)
+        total = valor + envio
         return [("Facturación", _pesos(total), True), ("Pedidos", _miles(pedidos), False),
                 ("Unidades", _miles(unidades), False), ("Marcas", _miles(marcas), False)]
     reemb = pd.to_numeric(col("ANULACIONES Y REEMBOLSOS"), errors="coerce").sum()
@@ -1498,6 +1567,30 @@ with st.container(border=True):
         selected_brands = st.multiselect("🏷️ Marcas", available_brands, default=available_brands,
                                          key=f"marcas_{canal}")
 
+if canal == "MercadoLibre" and tipo_meli == "Ventas":
+    with st.expander("🔎 Revisar importes de un pack / orden puntual"):
+        ids_v = st.text_area("Pack IDs u órdenes de MeLi (uno por línea)", key="ids_venta", height=80)
+        if st.button("Revisar", key="btn_revisar_venta") and ids_v.strip():
+            for id_x in dict.fromkeys(x.strip() for x in ids_v.replace(",", "\n").splitlines() if x.strip()):
+                encontrado = False
+                for m in MELI_CUENTAS:
+                    try:
+                        res = diagnosticar_envio(m, id_x)
+                    except Exception as e:
+                        if "no conectada" not in str(e):
+                            st.warning(f"{id_x} / {m}: {e}")
+                        continue
+                    if res is None:
+                        continue
+                    encontrado = True
+                    resumen, crudo = res
+                    st.markdown(f"**{id_x}** — {m}")
+                    st.markdown("\n".join(f"- {k}: **{_pesos(v)}**" for k, v in resumen.items()))
+                    st.json(crudo, expanded=False)
+                    break
+                if not encontrado:
+                    st.markdown(f"**{id_x}** — no lo encontré en ninguna de las cuentas conectadas.")
+
 if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
     with st.expander("🔎 Buscar devoluciones de packs / órdenes puntuales"):
         ids_txt = st.text_area("Pack IDs u órdenes de MeLi (uno por línea)", key="ids_dev", height=100)
@@ -1611,8 +1704,11 @@ if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Gen
                 descargar_excel(df, "Ventas", f"Reporte_{start_date}_al_{end_date}.xlsx", start_time, "shopify")
             elif tipo_meli == "Ventas":
                 df = df.drop(columns=["_item_id", "_unit_price"], errors="ignore")
-                # Total del pedido: suma del valor de todos los artículos del mismo pack (se repite en cada fila)
-                total_pack = df.groupby(["MARCA", "PACK ID"])["VALOR ARTICULO"].transform("sum")
+                # Envío del pack repetido en todas sus filas (entra en la facturación)
+                df["IMPORTE DEL ENVIO"] = df.groupby(["MARCA", "PACK ID"])["IMPORTE DEL ENVIO"].transform("sum")
+                # Total del pedido = artículos del pack + envío del pack (se repite en cada fila)
+                total_pack = (df.groupby(["MARCA", "PACK ID"])["VALOR ARTICULO"].transform("sum")
+                              + df["IMPORTE DEL ENVIO"])
                 df.insert(df.columns.get_loc("VALOR ARTICULO") + 1, "TOTAL SUMA VALOR PEDIDO", total_pack)
                 descargar_excel(df, "Ventas MeLi", f"Reporte_MeLi_{start_date}_al_{end_date}.xlsx", start_time,
                                 "ventas")
