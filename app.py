@@ -1611,6 +1611,9 @@ if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Gen
                 descargar_excel(df, "Ventas", f"Reporte_{start_date}_al_{end_date}.xlsx", start_time, "shopify")
             elif tipo_meli == "Ventas":
                 df = df.drop(columns=["_item_id", "_unit_price"], errors="ignore")
+                # Total del pedido: suma del valor de todos los artículos del mismo pack (se repite en cada fila)
+                total_pack = df.groupby(["MARCA", "PACK ID"])["VALOR ARTICULO"].transform("sum")
+                df.insert(df.columns.get_loc("VALOR ARTICULO") + 1, "TOTAL SUMA VALOR PEDIDO", total_pack)
                 descargar_excel(df, "Ventas MeLi", f"Reporte_MeLi_{start_date}_al_{end_date}.xlsx", start_time,
                                 "ventas")
             elif tipo_meli == "Devoluciones":
