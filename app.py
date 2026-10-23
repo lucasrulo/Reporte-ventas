@@ -859,6 +859,172 @@ def diagnosticar_envio(marca, id_txt):
     return resumen, crudo
 
 
+# ---------- Reporte contable (liquidaciones de Mercado Pago) ----------
+MP_API = "https://api.mercadopago.com"
+COLUMNAS_CONTABLE = [
+    "MARCA", "NUMERO DE PEDIDO", "PACK ID", "ID PAGO MP", "FECHA", "FECHA LIBERACION", "MOVIMIENTO",
+    "DESCRIPCION", "MONTO BRUTO DE LA OPERACION", "COMISION MERCADO LIBRE (INCLUYE IVA)",
+    "COMISION POR OFRECER CUOTAS SIN INTERES", "COSTO DE ENVIO", "IMPUESTOS", "MONTO NETO",
+]
+
+
+def _mp_token_extra(marca):
+    """Opcional: token propio de Mercado Pago por marca en secrets [meli.mp_tokens]."""
+    try:
+        return dict(MELI_CFG.get("mp_tokens", {})).get(marca, "")
+    except Exception:
+        return ""
+
+
+def clasificar_cargo(nombre, tipo=""):
+    n = f"{nombre} {tipo}".lower()
+    if tipo == "tax" or any(k in n for k in ("tax", "iibb", "sirtac", "impuesto", "retenc", "percep", "ganancia",
+                                             "debitos_creditos", "withholding")):
+        return "IMPUESTOS"
+    if any(k in n for k in ("financ", "cuota", "installment", "interest")):
+        return "COMISION POR OFRECER CUOTAS SIN INTERES"
+    if any(k in n for k in ("ship", "envio", "envío")):
+        return "COSTO DE ENVIO"
+    return "COMISION MERCADO LIBRE (INCLUYE IVA)"
+
+
+def desglose_pago(p):
+    """Del pago de Mercado Pago saca: bruto, comisiones, envío, impuestos y neto (cobro y devolución)."""
+    cargos = {k: 0.0 for k in ("COMISION MERCADO LIBRE (INCLUYE IVA)", "COMISION POR OFRECER CUOTAS SIN INTERES",
+                               "COSTO DE ENVIO", "IMPUESTOS")}
+    devueltos = dict(cargos)
+    hay_impuestos = False
+    detalles = p.get("charges_details") or []
+    if detalles:
+        for c in detalles:
+            cuentas = c.get("accounts") or {}
+            if cuentas.get("from") and cuentas.get("from") != "collector":
+                continue  # lo paga el comprador, no el vendedor
+            cat = clasificar_cargo(c.get("name") or "", c.get("type") or "")
+            montos = c.get("amounts") or {}
+            cargos[cat] += num(montos.get("original"))
+            devueltos[cat] += num(montos.get("refunded"))
+            hay_impuestos = hay_impuestos or cat == "IMPUESTOS"
+    else:
+        for f in p.get("fee_details") or []:
+            if f.get("fee_payer") and f.get("fee_payer") != "collector":
+                continue
+            cat = clasificar_cargo(f.get("type") or "")
+            cargos[cat] += num(f.get("amount"))
+            hay_impuestos = hay_impuestos or cat == "IMPUESTOS"
+    if not hay_impuestos:
+        cargos["IMPUESTOS"] += num(p.get("taxes_amount"))
+    bruto = num(p.get("transaction_amount"))
+    neto = num((p.get("transaction_details") or {}).get("net_received_amount"))
+    if not neto:
+        neto = bruto - sum(cargos.values())
+    return bruto, cargos, devueltos, neto
+
+
+class MeliContable(MeliReporte):
+    def pago_mp(self, payment_id):
+        token = _mp_token_extra(self.marca) or self.tok["access_token"]
+        for intento in range(4):
+            try:
+                r = requests.get(f"{MP_API}/v1/payments/{payment_id}", timeout=30,
+                                 headers={"Authorization": f"Bearer {token}"})
+            except requests.RequestException:
+                time_lib.sleep(2 * (intento + 1))
+                continue
+            if r.status_code == 429 or r.status_code >= 500:
+                time_lib.sleep(2 * (intento + 1))
+                continue
+            if r.status_code != 200:
+                return {"_error": f"HTTP {r.status_code} {r.text[:150]}"}
+            return r.json()
+        return {"_error": "sin respuesta"}
+
+    def filas_orden(self, o, pagos_mp, env, envios_contados):
+        titulos = " | ".join((oi.get("item") or {}).get("title", "") for oi in (o.get("order_items") or []))
+        base = {"MARCA": self.marca, "NUMERO DE PEDIDO": str(o["id"]), "PACK ID": str(o.get("pack_id") or o["id"]),
+                "DESCRIPCION": titulos}
+        filas, envio_en_pago = [], False
+        for p in pagos_mp:
+            if p.get("_error") or p.get("status") not in ("approved", "refunded", "charged_back",
+                                                          "partially_refunded", "in_mediation"):
+                continue
+            bruto, cargos, devueltos, neto = desglose_pago(p)
+            envio_en_pago = envio_en_pago or cargos["COSTO DE ENVIO"] > 0
+            fecha = _fecha_corta(p.get("date_approved") or p.get("date_created"))
+            liberacion = _fecha_corta(p.get("money_release_date"))
+            fila = {**base, "ID PAGO MP": str(p.get("id")), "FECHA": fecha, "FECHA LIBERACION": liberacion,
+                    "MOVIMIENTO": "Pago", "MONTO BRUTO DE LA OPERACION": bruto, "MONTO NETO": neto}
+            for k, v in cargos.items():
+                fila[k] = -v if v else 0.0
+            filas.append(fila)
+            reemb = num(p.get("transaction_amount_refunded"))
+            if reemb:
+                dev = {**base, "ID PAGO MP": str(p.get("id")), "FECHA": _fecha_corta(
+                       ((p.get("refunds") or [{}])[-1] or {}).get("date_created") or p.get("date_last_updated")),
+                       "FECHA LIBERACION": "", "MOVIMIENTO": "Devolución de dinero",
+                       "MONTO BRUTO DE LA OPERACION": -reemb}
+                for k, v in devueltos.items():
+                    dev[k] = v
+                dev["MONTO NETO"] = -reemb + sum(devueltos.values())
+                filas.append(dev)
+        # Tarifa de envío que MeLi cobra aparte (una vez por envío), si no vino dentro del pago
+        sid = (o.get("shipping") or {}).get("id")
+        costo = env.get("costo_vendedor", 0.0)
+        if sid and costo and not envio_en_pago and sid not in envios_contados:
+            envios_contados.add(sid)
+            filas.append({**base, "ID PAGO MP": "", "FECHA": filas[0]["FECHA"] if filas else "",
+                          "FECHA LIBERACION": "", "MOVIMIENTO": "Tarifa de envío",
+                          "MONTO BRUTO DE LA OPERACION": 0.0, "COMISION MERCADO LIBRE (INCLUYE IVA)": 0.0,
+                          "COMISION POR OFRECER CUOTAS SIN INTERES": 0.0, "COSTO DE ENVIO": -costo,
+                          "IMPUESTOS": 0.0, "MONTO NETO": -costo})
+        return filas
+
+
+def generar_contable(marca, start_date, end_date, status_placeholder, ordenes=None):
+    rep = MeliContable(marca, token_vigente(marca))
+    if ordenes is None:
+        desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
+        hasta = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=ZONA_AR)
+        ordenes = rep.buscar_ordenes(desde, hasta, status_placeholder)
+
+    pago_ids = sorted({str(p.get("id")) for o in ordenes for p in (o.get("payments") or []) if p and p.get("id")})
+    status_placeholder.text(f"{marca}: leyendo {len(pago_ids)} cobros en Mercado Pago...")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        pagos = dict(zip(pago_ids, ex.map(rep.pago_mp, pago_ids)))
+    errores = [v["_error"] for v in pagos.values() if v.get("_error")]
+    if pago_ids and len(errores) == len(pago_ids):
+        raise RuntimeError("Mercado Pago no devolvió el detalle de los cobros (" + errores[0] + "). "
+                           "Puede que el token de MeLi no tenga acceso a Mercado Pago.")
+
+    ship_ids = sorted({(o.get("shipping") or {}).get("id") for o in ordenes} - {None})
+    status_placeholder.text(f"{marca}: consultando {len(ship_ids)} envíos...")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        envios = dict(zip(ship_ids, ex.map(rep.envio, ship_ids)))
+
+    filas, contados = [], set()
+    for o in sorted(ordenes, key=lambda x: x.get("date_created", "")):
+        pagos_o = [pagos.get(str(p.get("id")), {}) for p in (o.get("payments") or []) if p and p.get("id")]
+        filas.extend(rep.filas_orden(o, pagos_o, envios.get((o.get("shipping") or {}).get("id"), {}), contados))
+    return ordenes, filas, errores
+
+
+def diagnosticar_contable(marca, id_txt):
+    rep = MeliContable(marca, token_vigente(marca))
+    ordenes = MeliDevoluciones(marca, rep.tok).ordenes_de(None, id_txt)
+    if not ordenes:
+        return None
+    _, filas, _ = generar_contable(marca, None, None, st.empty(), ordenes=ordenes)
+    crudo = {}
+    for o in ordenes:
+        for p in o.get("payments") or []:
+            if p and p.get("id"):
+                d = rep.pago_mp(p["id"])
+                crudo[str(p["id"])] = {k: d.get(k) for k in (
+                    "_error", "status", "transaction_amount", "transaction_amount_refunded", "taxes_amount",
+                    "transaction_details", "fee_details", "charges_details", "money_release_date")}
+    return filas, crudo
+
+
 # ---------- Devoluciones ----------
 # Flujo: reclamos (claims) del vendedor -> los que tienen devolución -> orden original.
 ESTADO_DEVOLUCION = {
@@ -1401,6 +1567,13 @@ def calcular_kpis(df, tipo):
     pedidos = col("PACK ID").nunique()
     unidades = pd.to_numeric(col("CANTIDAD"), errors="coerce").sum()
     valor = pd.to_numeric(col("VALOR ARTICULO"), errors="coerce").sum()
+    if tipo == "contable":
+        def suma(c):
+            return pd.to_numeric(col(c), errors="coerce").sum()
+        comisiones = suma("COMISION MERCADO LIBRE (INCLUYE IVA)") + suma("COMISION POR OFRECER CUOTAS SIN INTERES")
+        return [("Monto neto", _pesos(suma("MONTO NETO")), True), ("Bruto", _pesos(suma("MONTO BRUTO DE LA OPERACION"))
+                 , False), ("Comisiones", _pesos(comisiones), False),
+                ("Envío + impuestos", _pesos(suma("COSTO DE ENVIO") + suma("IMPUESTOS")), False)]
     if tipo == "ventas":
         # El envío se repite en cada fila del pack: se cuenta una sola vez por pack
         envio = (pd.to_numeric(df.drop_duplicates(["MARCA", "PACK ID"])["IMPORTE DEL ENVIO"], errors="coerce").sum()
@@ -1504,9 +1677,13 @@ with st.container(border=True):
             st.stop()
 
         opciones_tipo = {"💰 Ventas": "Ventas", "↩️ Devoluciones": "Devoluciones",
-                         "🚫 Cancelados / No entregados": "Cancelados / No entregados"}
+                         "🚫 Cancelados / No entregados": "Cancelados / No entregados",
+                         "🧾 Contable": "Contable"}
         tipo_meli = opciones_tipo[st.radio("Reporte", list(opciones_tipo), horizontal=True,
                                            label_visibility="collapsed")]
+        if tipo_meli == "Contable":
+            st.caption("Detalle de cada cobro en Mercado Pago (bruto, comisiones, cuotas sin interés, envío, "
+                       "impuestos y neto) de las ventas del período, más devoluciones de dinero y tarifas de envío.")
         if tipo_meli == "Cancelados / No entregados":
             st.caption("Ventas pagadas que se cancelaron antes de entregarse o cuyo envío no llegó al comprador, "
                        "según la fecha en que pasó.")
@@ -1591,6 +1768,33 @@ if canal == "MercadoLibre" and tipo_meli == "Ventas":
                 if not encontrado:
                     st.markdown(f"**{id_x}** — no lo encontré en ninguna de las cuentas conectadas.")
 
+if canal == "MercadoLibre" and tipo_meli == "Contable":
+    with st.expander("🔎 Revisar el detalle contable de un pack / orden puntual"):
+        ids_c = st.text_area("Pack IDs u órdenes de MeLi (uno por línea)", key="ids_cont", height=80)
+        if st.button("Revisar", key="btn_revisar_cont") and ids_c.strip():
+            for id_x in dict.fromkeys(x.strip() for x in ids_c.replace(",", "\n").splitlines() if x.strip()):
+                encontrado = False
+                for m in MELI_CUENTAS:
+                    try:
+                        res = diagnosticar_contable(m, id_x)
+                    except Exception as e:
+                        if "no conectada" not in str(e):
+                            st.warning(f"{id_x} / {m}: {e}")
+                        continue
+                    if res is None:
+                        continue
+                    encontrado = True
+                    filas_c, crudo = res
+                    st.markdown(f"**{id_x}** — {m}")
+                    if filas_c:
+                        df_c = pd.DataFrame(filas_c)
+                        st.dataframe(df_c[[c for c in COLUMNAS_CONTABLE if c in df_c.columns]],
+                                     use_container_width=True, hide_index=True)
+                    st.json(crudo, expanded=False)
+                    break
+                if not encontrado:
+                    st.markdown(f"**{id_x}** — no lo encontré en ninguna de las cuentas conectadas.")
+
 if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
     with st.expander("🔎 Buscar devoluciones de packs / órdenes puntuales"):
         ids_txt = st.text_area("Pack IDs u órdenes de MeLi (uno por línea)", key="ids_dev", height=100)
@@ -1629,6 +1833,7 @@ if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
 
 st.write("")
 _txt_boton = {"Ventas": "Generar reporte de ventas", "Devoluciones": "Generar reporte de devoluciones",
+              "Contable": "Generar reporte contable",
               "Cancelados / No entregados": "Generar reporte de cancelados"}
 if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Generar reporte de Shopify'}",
              type="primary", use_container_width=True):
@@ -1684,6 +1889,12 @@ if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Gen
                         reclamos, filas = generar_devoluciones(marca, start_date, end_date, status_placeholder,
                                                                campo=campo_dev)
                         resultados.append((True, f"{marca} · {len(filas)} filas"))
+                    elif tipo_meli == "Contable":
+                        ordenes, filas, errores_mp = generar_contable(marca, start_date, end_date, status_placeholder)
+                        resultados.append((True, f"{marca} · {len(ordenes)} órdenes"))
+                        if errores_mp:
+                            st.warning(f"{marca}: {len(errores_mp)} cobros sin detalle de Mercado Pago "
+                                       f"({errores_mp[0][:80]}).")
                     else:
                         candidatas, filas = generar_cancelados(marca, start_date, end_date, status_placeholder)
                         resultados.append((True, f"{marca} · {len(filas)} filas"))
@@ -1716,6 +1927,10 @@ if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Gen
                 df = df[[c for c in COLUMNAS_DEVOLUCION if c in df.columns]]
                 descargar_excel(df, "Devoluciones MeLi",
                                 f"Devoluciones_MeLi_{start_date}_al_{end_date}.xlsx", start_time, "devoluciones")
+            elif tipo_meli == "Contable":
+                df = df[[c for c in COLUMNAS_CONTABLE if c in df.columns]].fillna(0)
+                descargar_excel(df, "Contable MeLi", f"Contable_MeLi_{start_date}_al_{end_date}.xlsx", start_time,
+                                "contable")
             else:
                 df = df[[c for c in COLUMNAS_CANCELADOS if c in df.columns]]
                 descargar_excel(df, "Cancelados MeLi",
@@ -1725,6 +1940,8 @@ if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Gen
             que = "ventas"
             if canal == "MercadoLibre" and tipo_meli == "Devoluciones":
                 que = "devoluciones"
+            elif canal == "MercadoLibre" and tipo_meli == "Contable":
+                que = "cobros"
             elif canal == "MercadoLibre" and tipo_meli != "Ventas":
                 que = "cancelaciones ni envíos no entregados"
             st.info(f"🌤️ No se registraron {que} en el período seleccionado.")
