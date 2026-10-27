@@ -702,6 +702,19 @@ class MeliReporte:
             s = r.json()
             out["estado_envio"] = estado_envio_meli(s.get("status"), s.get("substatus"))
             out["tracking"] = str(s.get("tracking_number") or "")
+            recv = s.get("receiver_address") or ((s.get("destination") or {}).get("shipping_address")) or {}
+
+            def _nombre(x):
+                return x.get("name") if isinstance(x, dict) else (x or "")
+            calle = recv.get("address_line") or " ".join(
+                str(v) for v in (recv.get("street_name"), recv.get("street_number")) if v)
+            out["dest"] = {
+                "nombre": recv.get("receiver_name") or (s.get("destination") or {}).get("receiver_name") or "",
+                "direccion": calle or "",
+                "localidad": _nombre(recv.get("city")),
+                "provincia": _nombre(recv.get("state")),
+                "cp": recv.get("zip_code") or "",
+            }
             opcion = s.get("shipping_option") or {}
             out["costo_opcion"] = num(opcion.get("cost"))
             out["_raw_opcion"] = {k: opcion.get(k) for k in ("cost", "list_cost", "currency_id", "name")}
@@ -788,6 +801,76 @@ def importe_envio_comprador(o, env, shipping_id, envio_ya_contado):
             or env.get("costo_comprador", 0.0) or env.get("costo_opcion", 0.0))
 
 
+def parse_billing(d):
+    """Datos de facturación del comprador (formato nuevo y viejo de la API de MeLi)."""
+    if not isinstance(d, dict):
+        return {}
+    bi = (d.get("buyer") or {}).get("billing_info") or d.get("billing_info") or d
+    extra = {x.get("type"): x.get("value") for x in (bi.get("additional_info") or []) if isinstance(x, dict)}
+    ident = bi.get("identification") or {}
+    addr = bi.get("address") or {}
+
+    def _n(x):
+        return x.get("name") if isinstance(x, dict) else (x or "")
+    nombre = " ".join(str(v) for v in (bi.get("name") or extra.get("FIRST_NAME"),
+                                        bi.get("last_name") or extra.get("LAST_NAME")) if v)
+    razon = bi.get("business_name") or extra.get("BUSINESS_NAME") or ""
+    calle = " ".join(str(v) for v in (addr.get("street_name") or extra.get("STREET_NAME"),
+                                       addr.get("street_number") or extra.get("STREET_NUMBER")) if v)
+    taxes = bi.get("taxes") or {}
+    cond = ((taxes.get("taxpayer_type") or {}).get("description") if isinstance(taxes, dict) else "") \
+        or extra.get("TAXPAYER_TYPE_ID") or ""
+    return {
+        "tipo_doc": ident.get("type") or bi.get("doc_type") or extra.get("DOC_TYPE") or "",
+        "doc": str(ident.get("number") or bi.get("doc_number") or extra.get("DOC_NUMBER") or ""),
+        "nombre": razon or nombre,
+        "direccion": calle,
+        "localidad": addr.get("city_name") or _n(addr.get("city")) or extra.get("CITY_NAME") or "",
+        "provincia": _n(addr.get("state")) or addr.get("state_name") or extra.get("STATE_NAME") or "",
+        "cp": addr.get("zip_code") or extra.get("ZIP_CODE") or "",
+        "condicion_iva": cond,
+    }
+
+
+def billing_crudo(rep, o):
+    """Pide los datos de facturación de una orden (endpoint nuevo y, si no, el viejo)."""
+    bid = ((o.get("buyer") or {}).get("billing_info") or {}).get("id")
+    if bid:
+        for headers in ({"x-version": "2"}, {}):
+            try:
+                r = rep.s.get(f"{MELI_API}/orders/billing-info/MLA/{bid}", timeout=30, headers=headers)
+                if r.status_code == 200:
+                    return r.json()
+            except requests.RequestException:
+                pass
+    r = rep.get(f"/orders/{o['id']}/billing_info")
+    if r is not None and r.status_code == 200:
+        return r.json()
+    return {}
+
+
+def datos_cliente(o, billing, env):
+    """Combina facturación + domicilio de entrega (respaldo cuando falta algún dato)."""
+    b = parse_billing(billing)
+    dest = env.get("dest") or {}
+    comprador = o.get("buyer") or {}
+    nombre_buyer = " ".join(str(v) for v in (comprador.get("first_name"), comprador.get("last_name")) if v)
+    return {
+        "TIPO DOC": b.get("tipo_doc", ""),
+        "DNI / CUIT": b.get("doc", ""),
+        "NOMBRE Y APELLIDO": b.get("nombre") or nombre_buyer or dest.get("nombre", ""),
+        "CONDICION IVA": b.get("condicion_iva", ""),
+        "DIRECCION": b.get("direccion") or dest.get("direccion", ""),
+        "LOCALIDAD": b.get("localidad") or dest.get("localidad", ""),
+        "PROVINCIA": b.get("provincia") or dest.get("provincia", ""),
+        "CODIGO POSTAL": b.get("cp") or dest.get("cp", ""),
+    }
+
+
+COLUMNAS_CLIENTE = ["TIPO DOC", "DNI / CUIT", "NOMBRE Y APELLIDO", "CONDICION IVA", "DIRECCION", "LOCALIDAD",
+                    "PROVINCIA", "CODIGO POSTAL"]
+
+
 def generar_meli(marca, start_date, end_date, status_placeholder):
     rep = MeliReporte(marca, token_vigente(marca))
     desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
@@ -811,10 +894,19 @@ def generar_meli(marca, start_date, end_date, status_placeholder):
             envios[sid]["pagos_envio_total"] = (envios[sid].get("pagos_envio_total", 0.0)
                                                 + sum(num(p.get("shipping_cost")) for p in pagos))
 
+    # Datos del cliente (DNI, nombre, domicilio): una consulta por orden
+    status_placeholder.text(f"{marca}: leyendo datos de facturación de {len(ordenes)} órdenes...")
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        billings = dict(zip([o["id"] for o in ordenes], ex.map(lambda o: billing_crudo(rep, o), ordenes)))
+
     filas, contados = [], set()
     for o in sorted(ordenes, key=lambda x: x.get("date_created", "")):
         sid = (o.get("shipping") or {}).get("id")
-        filas.extend(rep.a_filas(o, envios.get(sid, {}), contados))
+        env = envios.get(sid, {})
+        cliente = datos_cliente(o, billings.get(o["id"], {}), env)
+        for f in rep.a_filas(o, env, contados):
+            f.update(cliente)
+            filas.append(f)
     return ordenes, filas
 
 
@@ -850,7 +942,10 @@ def diagnosticar_envio(marca, id_txt):
         "COSTO ENVIO VENDEDOR": sum(f["COSTO ENVIO VENDEDOR"] for f in filas),
         "VALOR ARTICULOS": sum(f["VALOR ARTICULO"] for f in filas),
     }
-    crudo = {"ordenes": detalle,
+    crudo = {"facturacion": {str(o["id"]): {"leido": datos_cliente(o, billing_crudo(rep, o),
+                                                                    envios.get((o.get("shipping") or {}).get("id"), {})),
+                                             "crudo": billing_crudo(rep, o)} for o in ordenes},
+             "ordenes": detalle,
              "envios": {str(k): {"costo_comprador(costs.receiver)": v.get("costo_comprador"),
                                  "costo_opcion(shipping_option)": v.get("costo_opcion"),
                                  "pagos_envio_total": v.get("pagos_envio_total"),
@@ -1921,6 +2016,11 @@ if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Gen
                 total_pack = (df.groupby(["MARCA", "PACK ID"])["VALOR ARTICULO"].transform("sum")
                               + df["IMPORTE DEL ENVIO"])
                 df.insert(df.columns.get_loc("VALOR ARTICULO") + 1, "TOTAL SUMA VALOR PEDIDO", total_pack)
+                # Datos del cliente justo después de la FECHA
+                cols_cli = [c for c in COLUMNAS_CLIENTE if c in df.columns]
+                resto = [c for c in df.columns if c not in cols_cli]
+                pos = resto.index("FECHA") + 1 if "FECHA" in resto else len(resto)
+                df = df[resto[:pos] + cols_cli + resto[pos:]]
                 descargar_excel(df, "Ventas MeLi", f"Reporte_MeLi_{start_date}_al_{end_date}.xlsx", start_time,
                                 "ventas")
             elif tipo_meli == "Devoluciones":
