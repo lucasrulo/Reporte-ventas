@@ -587,6 +587,32 @@ def token_vigente(marca, forzar=False):
         return tokens[marca]
 
 
+def verificar_cuenta(marca):
+    """Chequea a qué cuenta de MeLi quedó conectada una marca y si puede leer sus ventas."""
+    try:
+        rep = MeliReporte(marca, token_vigente(marca))
+    except Exception as e:
+        return {"Estado": f"❌ {str(e)[:120]}"}
+    out = {}
+    me = rep.get("/users/me")
+    if me is None or me.status_code != 200:
+        return {"Estado": f"❌ Token inválido (HTTP {getattr(me, 'status_code', '?')}): reconectá la cuenta"}
+    d = me.json()
+    out["Cuenta conectada (nickname)"] = d.get("nickname", "")
+    out["ID cuenta"] = str(d.get("id", ""))
+    desde = (datetime.now(ZONA_AR) - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00.000-03:00")
+    r = rep.get("/orders/search", {"seller": d.get("id"), "order.date_created.from": desde, "limit": 1})
+    if r is not None and r.status_code == 200:
+        total = (r.json().get("paging") or {}).get("total", 0)
+        out["Órdenes últimos 30 días"] = total
+        out["Estado"] = "✅ OK" if total else "⚠️ Conectada, pero sin ventas en 30 días: ¿es la cuenta correcta?"
+    else:
+        out["Órdenes últimos 30 días"] = ""
+        out["Estado"] = (f"❌ No puede leer ventas (HTTP {getattr(r, 'status_code', '?')}). Suele pasar si se "
+                         "autorizó con un usuario colaborador y no con el titular de la cuenta.")
+    return out
+
+
 # ---------- Reporte ----------
 ESTADO_ORDEN_MELI = {
     "paid": "Pagada",
@@ -958,8 +984,9 @@ def diagnosticar_envio(marca, id_txt):
 MP_API = "https://api.mercadopago.com"
 COLUMNAS_CONTABLE = [
     "MARCA", "NUMERO DE PEDIDO", "PACK ID", "ID PAGO MP", "FECHA", "FECHA LIBERACION", "MOVIMIENTO",
-    "DESCRIPCION", "MONTO BRUTO DE LA OPERACION", "COMISION MERCADO LIBRE (INCLUYE IVA)",
-    "COMISION POR OFRECER CUOTAS SIN INTERES", "COSTO DE ENVIO", "IMPUESTOS", "MONTO NETO",
+    "ESTADO ORDEN", "ESTADO PAGO MP", "DESCRIPCION", "MONTO BRUTO DE LA OPERACION",
+    "COMISION MERCADO LIBRE (INCLUYE IVA)", "COMISION POR OFRECER CUOTAS SIN INTERES", "COSTO DE ENVIO",
+    "IMPUESTOS", "MONTO NETO", "SALDO DEL PEDIDO",
 ]
 
 
@@ -1016,6 +1043,11 @@ def desglose_pago(p):
     return bruto, cargos, devueltos, neto
 
 
+ESTADO_PAGO_MP = {"approved": "Aprobado", "refunded": "Devuelto", "partially_refunded": "Devuelto parcial",
+                  "charged_back": "Contracargo", "in_mediation": "En mediación", "cancelled": "Cancelado",
+                  "rejected": "Rechazado", "pending": "Pendiente", "in_process": "En proceso"}
+
+
 class MeliContable(MeliReporte):
     def pago_mp(self, payment_id):
         token = _mp_token_extra(self.marca) or self.tok["access_token"]
@@ -1037,7 +1069,8 @@ class MeliContable(MeliReporte):
     def filas_orden(self, o, pagos_mp, env, envios_contados):
         titulos = " | ".join((oi.get("item") or {}).get("title", "") for oi in (o.get("order_items") or []))
         base = {"MARCA": self.marca, "NUMERO DE PEDIDO": str(o["id"]), "PACK ID": str(o.get("pack_id") or o["id"]),
-                "DESCRIPCION": titulos}
+                "DESCRIPCION": titulos,
+                "ESTADO ORDEN": ESTADO_ORDEN_MELI.get(o.get("status"), o.get("status", ""))}
         filas, envio_en_pago = [], False
         for p in pagos_mp:
             if p.get("_error") or p.get("status") not in ("approved", "refunded", "charged_back",
@@ -1047,21 +1080,41 @@ class MeliContable(MeliReporte):
             envio_en_pago = envio_en_pago or cargos["COSTO DE ENVIO"] > 0
             fecha = _fecha_corta(p.get("date_approved") or p.get("date_created"))
             liberacion = _fecha_corta(p.get("money_release_date"))
+            estado_pago = ESTADO_PAGO_MP.get(p.get("status"), p.get("status") or "")
+            if p.get("status_detail"):
+                estado_pago += f" ({p.get('status_detail')})"
             fila = {**base, "ID PAGO MP": str(p.get("id")), "FECHA": fecha, "FECHA LIBERACION": liberacion,
-                    "MOVIMIENTO": "Pago", "MONTO BRUTO DE LA OPERACION": bruto, "MONTO NETO": neto}
+                    "MOVIMIENTO": "Pago", "ESTADO PAGO MP": estado_pago,
+                    "MONTO BRUTO DE LA OPERACION": bruto, "MONTO NETO": neto}
             for k, v in cargos.items():
                 fila[k] = -v if v else 0.0
             filas.append(fila)
-            reemb = num(p.get("transaction_amount_refunded"))
+            reemb = num(p.get("transaction_amount_refunded")) or sum(
+                num((r or {}).get("amount")) for r in (p.get("refunds") or []))
+            movimiento = "Devolución de dinero"
+            if not reemb and p.get("status") == "charged_back":
+                reemb, movimiento = bruto, "Débito por contracargo / mediación"
             if reemb:
                 dev = {**base, "ID PAGO MP": str(p.get("id")), "FECHA": _fecha_corta(
                        ((p.get("refunds") or [{}])[-1] or {}).get("date_created") or p.get("date_last_updated")),
-                       "FECHA LIBERACION": "", "MOVIMIENTO": "Devolución de dinero",
+                       "FECHA LIBERACION": "", "MOVIMIENTO": movimiento, "ESTADO PAGO MP": estado_pago,
                        "MONTO BRUTO DE LA OPERACION": -reemb}
                 for k, v in devueltos.items():
                     dev[k] = v
                 dev["MONTO NETO"] = -reemb + sum(devueltos.values())
                 filas.append(dev)
+        # Venta cancelada pero Mercado Pago no registra reintegro en el cobro: se avisa para conciliar
+        hay_reintegro = any(f["MOVIMIENTO"] != "Pago" for f in filas)
+        if o.get("status") == "cancelled" and filas and not hay_reintegro:
+            cd = o.get("cancel_detail") or {}
+            filas.append({**base, "ID PAGO MP": filas[0]["ID PAGO MP"],
+                          "FECHA": _fecha_corta(cd.get("date") or o.get("date_closed") or o.get("date_last_updated")),
+                          "FECHA LIBERACION": "", "ESTADO PAGO MP": filas[0].get("ESTADO PAGO MP", ""),
+                          "MOVIMIENTO": "⚠️ Cancelada sin reintegro en el cobro (revisar débito en MP)"
+                                        + (f" · {cd.get('description')}" if cd.get("description") else ""),
+                          "MONTO BRUTO DE LA OPERACION": 0.0, "COMISION MERCADO LIBRE (INCLUYE IVA)": 0.0,
+                          "COMISION POR OFRECER CUOTAS SIN INTERES": 0.0, "COSTO DE ENVIO": 0.0,
+                          "IMPUESTOS": 0.0, "MONTO NETO": 0.0})
         # Tarifa de envío que MeLi cobra aparte (una vez por envío), si no vino dentro del pago
         sid = (o.get("shipping") or {}).get("id")
         costo = env.get("costo_vendedor", 0.0)
@@ -1077,10 +1130,25 @@ class MeliContable(MeliReporte):
 
 def generar_contable(marca, start_date, end_date, status_placeholder, ordenes=None):
     rep = MeliContable(marca, token_vigente(marca))
+    ids_periodo, desde, hasta = None, None, None
     if ordenes is None:
         desde = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=ZONA_AR)
         hasta = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=ZONA_AR)
         ordenes = rep.buscar_ordenes(desde, hasta, status_placeholder)
+        ids_periodo = {o["id"] for o in ordenes}
+        # Ventas de períodos anteriores que se cancelaron o reintegraron dentro del rango
+        status_placeholder.text(f"{marca}: buscando cancelaciones y reintegros de ventas anteriores...")
+        actualizadas = rep.buscar_ordenes(desde, max(hasta, datetime.now(ZONA_AR)), status_placeholder,
+                                          campo="order.date_last_updated")
+        for o in actualizadas:
+            if o["id"] in ids_periodo:
+                continue
+            pagos_o = o.get("payments") or []
+            if o.get("status") == "cancelled" or any((p or {}).get("status") in
+                                                     ("refunded", "partially_refunded", "charged_back")
+                                                     or num((p or {}).get("transaction_amount_refunded"))
+                                                     for p in pagos_o):
+                ordenes.append(o)
 
     pago_ids = sorted({str(p.get("id")) for o in ordenes for p in (o.get("payments") or []) if p and p.get("id")})
     status_placeholder.text(f"{marca}: leyendo {len(pago_ids)} cobros en Mercado Pago...")
@@ -1099,7 +1167,27 @@ def generar_contable(marca, start_date, end_date, status_placeholder, ordenes=No
     filas, contados = [], set()
     for o in sorted(ordenes, key=lambda x: x.get("date_created", "")):
         pagos_o = [pagos.get(str(p.get("id")), {}) for p in (o.get("payments") or []) if p and p.get("id")]
-        filas.extend(rep.filas_orden(o, pagos_o, envios.get((o.get("shipping") or {}).get("id"), {}), contados))
+        filas_o = rep.filas_orden(o, pagos_o, envios.get((o.get("shipping") or {}).get("id"), {}), contados)
+        if ids_periodo is not None and o["id"] not in ids_periodo:
+            # Venta de otro período: solo los reintegros/cancelaciones que cayeron dentro del rango
+            def _en_rango(fl):
+                try:
+                    f_ = datetime.strptime(fl["FECHA"], "%d/%m/%Y").replace(tzinfo=ZONA_AR)
+                    return desde <= f_ <= hasta
+                except Exception:
+                    return False
+            filas_o = [fl for fl in filas_o if fl["MOVIMIENTO"] != "Pago"
+                       and fl["MOVIMIENTO"] != "Tarifa de envío" and _en_rango(fl)]
+            for fl in filas_o:
+                fl["MOVIMIENTO"] += " (venta de período anterior)"
+        filas.extend(filas_o)
+
+    # Saldo neto por pedido (venta - reintegros - tarifas) para conciliar de un vistazo
+    saldos = {}
+    for fl in filas:
+        saldos[fl["NUMERO DE PEDIDO"]] = saldos.get(fl["NUMERO DE PEDIDO"], 0.0) + num(fl.get("MONTO NETO"))
+    for fl in filas:
+        fl["SALDO DEL PEDIDO"] = round(saldos[fl["NUMERO DE PEDIDO"]], 2)
     return ordenes, filas, errores
 
 
@@ -1804,6 +1892,22 @@ with st.container(border=True):
                 url = f"{MELI_AUTH}?" + urlencode({"response_type": "code", "client_id": MELI_APP_ID,
                                                    "redirect_uri": MELI_REDIRECT, "state": m})
                 c2.link_button("Reconectar" if info else "Conectar", url, use_container_width=True)
+
+            if st.button("🩺 Verificar cuentas", key="btn_verificar_cuentas"):
+                filas_v, ids_vistos = [], {}
+                for m in MELI_CUENTAS:
+                    if m not in conectadas:
+                        filas_v.append({"Marca": m, "Estado": "❌ Sin conectar"})
+                        continue
+                    v = verificar_cuenta(m)
+                    filas_v.append({"Marca": m, **v})
+                    if v.get("ID cuenta"):
+                        ids_vistos.setdefault(v["ID cuenta"], []).append(m)
+                st.dataframe(pd.DataFrame(filas_v), use_container_width=True, hide_index=True)
+                for uid, marcas_uid in ids_vistos.items():
+                    if len(marcas_uid) > 1:
+                        st.warning(f"⚠️ {', '.join(marcas_uid)} están conectadas a la **misma cuenta de MeLi** "
+                                   f"({uid}). Reconectá la que corresponda con la sesión de su propia cuenta.")
 
 # ---- Paso 2: período y marcas ----
 hoy_ar = datetime.now(ZONA_AR).date()
