@@ -1945,12 +1945,11 @@ def estados_trackingmore(numeros):
 
 
 def agregar_estado_correo(df):
-    """Suma ESTADO CORREO ARGENTINO / ULTIMO MOVIMIENTO / FECHA / DIAS SIN MOVIMIENTO a Ventas MeLi.
-    Solo consulta envíos que MeLi todavía no marca como entregados (ahorra cupo)."""
+    """Suma ESTADO CORREO ARGENTINO / ULTIMO MOVIMIENTO / FECHA / DIAS SIN MOVIMIENTO a Ventas MeLi,
+    para todos los envíos con número de seguimiento del rango de fechas del reporte."""
     if "NUMERO DE SEGUIMIENTO" not in df.columns:
         return df, ""
-    pend = df[(df["NUMERO DE SEGUIMIENTO"].astype(str).str.strip() != "")
-              & (df.get("ESTADO DEL PEDIDO", "") != "Entregado")]
+    pend = df[df["NUMERO DE SEGUIMIENTO"].astype(str).str.strip() != ""]   # todos los envíos del reporte
     estados, error = estados_correo(tuple(sorted(set(pend["NUMERO DE SEGUIMIENTO"].astype(str)))))
     ahora = datetime.now(ZONA_AR)
 
@@ -2146,9 +2145,9 @@ with st.container(border=True):
 consultar_correo = False
 if canal == "MercadoLibre" and tipo_meli == "Ventas":
     if True:  # consulta directa a Correo Argentino (TrackingMore queda como respaldo si hay API key)
-        consultar_correo = st.toggle("📮 Consultar estado en Correo Argentino (envíos no entregados)", value=True,
-                                     help="Consulta la web de seguimiento de Correo Argentino. Solo revisa los envíos "
-                                          "que MeLi todavía no marca como entregados.")
+        consultar_correo = st.toggle("📮 Consultar estado en Correo Argentino", value=True,
+                                     help="Consulta en la web de Correo Argentino el estado de todos los envíos "
+                                          "del rango de fechas del reporte.")
         dias_alerta = st.slider("Marcar como trabado si no se movió en (días)", 1, 10, 3)
         with st.expander("📮 Consultar números de seguimiento sueltos"):
             nums_txt = st.text_area("Números de seguimiento (uno por línea)", key="nums_correo", height=80)
