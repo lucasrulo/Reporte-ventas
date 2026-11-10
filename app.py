@@ -1838,7 +1838,10 @@ def _estado_simple(eventos):
 def _parse_correo(html):
     import re
     from html import unescape
-    filas = re.findall(r"<tr>(.*?)</tr>", html or "", flags=re.S | re.I)
+    html = html or ""
+    cuerpo = html[html.lower().find("<tbody"):] if "<tbody" in html.lower() else html
+    # Correo no cierra los <tr>: se corta por cada apertura de fila
+    filas = re.split(r"<tr[^>]*>", cuerpo, flags=re.I)[1:]
     eventos = []
     for f in filas:
         celdas = [unescape(re.sub(r"<[^>]+>", "", c)).strip() for c in re.findall(r"<td[^>]*>(.*?)</td>", f, re.S | re.I)]
