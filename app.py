@@ -1770,6 +1770,203 @@ def calcular_kpis(df, tipo):
             ("Unidades", _miles(unidades), False), ("Reembolsado", _pesos(reemb), False)]
 
 
+# ---------- Seguimiento Correo Argentino (vía TrackingMore) ----------
+TM_API = "https://api.trackingmore.com/v4"
+try:
+    TM_CFG = dict(st.secrets.get("trackingmore", {}))
+except Exception:
+    TM_CFG = {}
+TM_KEY = TM_CFG.get("api_key", "")
+TM_COURIER = TM_CFG.get("courier", "argentina-post")
+
+ESTADO_CORREO = {
+    "pending": "Pendiente de info", "notfound": "Sin datos en Correo", "inforeceived": "Etiqueta creada (no admitido)",
+    "transit": "En tránsito", "pickup": "En sucursal / para retirar", "delivered": "Entregado",
+    "undelivered": "No entregado", "exception": "Problema / excepción", "expired": "Sin movimiento (vencido)",
+}
+
+
+def _tm_headers():
+    return {"Tracking-Api-Key": TM_KEY, "Trackingmore-Api-Key": TM_KEY, "Content-Type": "application/json"}
+
+
+def _tm(method, path, **kw):
+    for intento in range(3):
+        try:
+            r = requests.request(method, f"{TM_API}{path}", headers=_tm_headers(), timeout=40, **kw)
+        except requests.RequestException:
+            time_lib.sleep(2 * (intento + 1))
+            continue
+        if r.status_code == 429 or r.status_code >= 500:
+            time_lib.sleep(2 * (intento + 1))
+            continue
+        return r
+    return None
+
+
+CA_URL = "https://www.correoargentino.com.ar/sites/all/modules/custom/ca_forms/api/wsFacade.php"
+CA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0 Safari/537.36",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.correoargentino.com.ar/formularios/mercadolibre",
+    "Origin": "https://www.correoargentino.com.ar",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+}
+
+
+def _estado_simple(eventos):
+    """Traduce la lista de movimientos de Correo a un estado simple."""
+    if not eventos:
+        return "Sin datos en Correo"
+    ult = eventos[0]["estado"].upper()
+    todos = " | ".join(e["estado"].upper() for e in eventos)
+    if any(k in ult for k in ("DEVOL", "NO ENTREG", "SIN EXITO", "SIN ÉXITO", "RECHAZ", "AUSENTE", "SINIESTR")):
+        return "Problema / no entregado"
+    if "ENTREG" in ult:
+        return "Entregado"
+    if any(k in ult for k in ("SUCURSAL", "ESPERA", "RETIRO", "DISPONIBLE")):
+        return "En sucursal / para retirar"
+    if any(k in ult for k in ("DISTRIBUC", "REPARTO", "EN CAMINO AL DOMICILIO")):
+        return "En distribución"
+    if "INGRESO AL CORREO" not in todos and "ADMIS" not in todos and all("PREIMPOS" in e["estado"].upper()
+                                                                          for e in eventos):
+        return "Etiqueta creada (no admitido)"
+    return "En tránsito"
+
+
+def _parse_correo(html):
+    import re
+    from html import unescape
+    filas = re.findall(r"<tr>(.*?)</tr>", html or "", flags=re.S | re.I)
+    eventos = []
+    for f in filas:
+        celdas = [unescape(re.sub(r"<[^>]+>", "", c)).strip() for c in re.findall(r"<td[^>]*>(.*?)</td>", f, re.S | re.I)]
+        if len(celdas) >= 2:
+            fecha = celdas[0]
+            planta = celdas[1] if len(celdas) > 1 else ""
+            estado = next((c for c in reversed(celdas[2:]) if c), "") if len(celdas) > 2 else ""
+            eventos.append({"fecha": fecha, "planta": planta, "estado": estado})
+    return eventos
+
+
+def _fecha_correo(txt):
+    try:
+        return datetime.strptime(txt.strip(), "%d-%m-%Y %H:%M").replace(tzinfo=ZONA_AR)
+    except Exception:
+        return None
+
+
+def consultar_correo_directo(numero):
+    """Consulta la web pública de seguimiento de Correo Argentino (envíos de MercadoLibre)."""
+    for intento in range(3):
+        try:
+            r = requests.post(CA_URL, data={"action": "mercadolibre", "id": numero}, headers=CA_HEADERS, timeout=25)
+        except requests.RequestException as e:
+            err = str(e)[:120]
+            time_lib.sleep(2 * (intento + 1))
+            continue
+        if r.status_code != 200 or "<table" not in r.text and "pieza" not in r.text:
+            err = f"HTTP {r.status_code}"
+            time_lib.sleep(2 * (intento + 1))
+            continue
+        eventos = _parse_correo(r.text)
+        ingreso = next((e for e in reversed(eventos) if "INGRESO AL CORREO" in e["estado"].upper()), None)
+        ult = eventos[0] if eventos else {}
+        f_ult = _fecha_correo(ult.get("fecha", "")) if ult else None
+        return {
+            "estado": _estado_simple(eventos),
+            "evento": " · ".join(x for x in (ult.get("estado", ""), ult.get("planta", "")) if x),
+            "fecha": f_ult.isoformat() if f_ult else "",
+            "ingreso": ingreso["fecha"][:10].replace("-", "/") if ingreso else "",
+        }
+    return {"_error": err}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def estados_correo(numeros):
+    """Estado de cada envío consultando directo a Correo Argentino; si falla y hay TrackingMore, usa eso."""
+    numeros = [n for n in dict.fromkeys(str(x).strip() for x in numeros) if n]
+    if not numeros:
+        return {}, ""
+    out, errores = {}, []
+    with ThreadPoolExecutor(max_workers=4) as ex:   # pocas consultas en paralelo, para no saturar la web
+        for n, res in zip(numeros, ex.map(consultar_correo_directo, numeros)):
+            if res.get("_error"):
+                errores.append(n)
+            else:
+                out[n] = res
+    if errores and TM_KEY:
+        extra, err_tm = estados_trackingmore(tuple(errores))
+        out.update(extra)
+        errores = [n for n in errores if n not in extra]
+    error = (f"No pude consultar {len(errores)} de {len(numeros)} envíos en la web de Correo Argentino "
+             "(puede estar bloqueando consultas automáticas o caída).") if errores else ""
+    return out, error
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def estados_trackingmore(numeros):
+    """{tracking: {...}} para una tupla de números. Registra los nuevos y trae el último estado."""
+    numeros = [n for n in dict.fromkeys(str(x).strip() for x in numeros) if n]
+    if not TM_KEY or not numeros:
+        return {}, ""
+    error = ""
+    for i in range(0, len(numeros), 40):
+        lote = [{"tracking_number": n, "courier_code": TM_COURIER} for n in numeros[i:i + 40]]
+        r = _tm("POST", "/trackings/batch", json=lote)   # si ya existen, TrackingMore lo informa y seguimos
+        if r is not None and r.status_code in (401, 403):
+            return {}, "La API key de TrackingMore no es válida o no tiene permisos."
+    out = {}
+    for i in range(0, len(numeros), 40):
+        r = _tm("GET", "/trackings/get", params={"tracking_numbers": ",".join(numeros[i:i + 40]),
+                                                  "courier_code": TM_COURIER})
+        if r is None or r.status_code != 200:
+            error = f"TrackingMore HTTP {getattr(r, 'status_code', '?')} {getattr(r, 'text', '')[:150]}"
+            continue
+        data = r.json().get("data") or []
+        if isinstance(data, dict):
+            data = data.get("items") or [data]
+        for d in data:
+            info = d.get("origin_info") or {}
+            eventos = info.get("trackinfo") or []
+            ult = eventos[0] if eventos else {}
+            fecha = d.get("latest_checkpoint_time") or ult.get("checkpoint_date") or ""
+            out[str(d.get("tracking_number"))] = {
+                "estado": ESTADO_CORREO.get(d.get("delivery_status"), d.get("delivery_status") or ""),
+                "evento": d.get("latest_event") or " · ".join(
+                    str(x) for x in (ult.get("tracking_detail"), ult.get("location")) if x),
+                "fecha": fecha,
+            }
+    return out, error
+
+
+def agregar_estado_correo(df):
+    """Suma ESTADO CORREO ARGENTINO / ULTIMO MOVIMIENTO / FECHA / DIAS SIN MOVIMIENTO a Ventas MeLi.
+    Solo consulta envíos que MeLi todavía no marca como entregados (ahorra cupo)."""
+    if "NUMERO DE SEGUIMIENTO" not in df.columns:
+        return df, ""
+    pend = df[(df["NUMERO DE SEGUIMIENTO"].astype(str).str.strip() != "")
+              & (df.get("ESTADO DEL PEDIDO", "") != "Entregado")]
+    estados, error = estados_correo(tuple(sorted(set(pend["NUMERO DE SEGUIMIENTO"].astype(str)))))
+    ahora = datetime.now(ZONA_AR)
+
+    def _dias(f):
+        t = _ts(f) if f else None
+        return (ahora - t).days if t is not None else ""
+    df["ESTADO CORREO ARGENTINO"] = df["NUMERO DE SEGUIMIENTO"].map(
+        lambda n: (estados.get(str(n)) or {}).get("estado", ""))
+    df["ULTIMO MOVIMIENTO CORREO"] = df["NUMERO DE SEGUIMIENTO"].map(
+        lambda n: (estados.get(str(n)) or {}).get("evento", ""))
+    df["FECHA ULTIMO MOVIMIENTO"] = df["NUMERO DE SEGUIMIENTO"].map(
+        lambda n: _fecha_corta((estados.get(str(n)) or {}).get("fecha")) if estados.get(str(n)) else "")
+    df["INGRESO AL CORREO"] = df["NUMERO DE SEGUIMIENTO"].map(
+        lambda n: (estados.get(str(n)) or {}).get("ingreso", ""))
+    df["DIAS SIN MOVIMIENTO"] = df["NUMERO DE SEGUIMIENTO"].map(
+        lambda n: _dias((estados.get(str(n)) or {}).get("fecha")) if estados.get(str(n)) else "")
+    return df, error
+
+
 def descargar_excel(df, nombre_hoja, file_name, start_time, tipo="ventas"):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1943,7 +2140,28 @@ with st.container(border=True):
         selected_brands = st.multiselect("🏷️ Marcas", available_brands, default=available_brands,
                                          key=f"marcas_{canal}")
 
+consultar_correo = False
 if canal == "MercadoLibre" and tipo_meli == "Ventas":
+    if True:  # consulta directa a Correo Argentino (TrackingMore queda como respaldo si hay API key)
+        consultar_correo = st.toggle("📮 Consultar estado en Correo Argentino (envíos no entregados)", value=True,
+                                     help="Consulta la web de seguimiento de Correo Argentino. Solo revisa los envíos "
+                                          "que MeLi todavía no marca como entregados.")
+        dias_alerta = st.slider("Marcar como trabado si no se movió en (días)", 1, 10, 3)
+        with st.expander("📮 Consultar números de seguimiento sueltos"):
+            nums_txt = st.text_area("Números de seguimiento (uno por línea)", key="nums_correo", height=80)
+            if st.button("Consultar", key="btn_correo") and nums_txt.strip():
+                est, err = estados_correo(tuple(sorted({x.strip() for x in nums_txt.splitlines() if x.strip()})))
+                if err:
+                    st.warning(err)
+                if est:
+                    st.dataframe(pd.DataFrame([{"NUMERO": k, "ESTADO": v["estado"], "ULTIMO MOVIMIENTO": v["evento"],
+                                                "FECHA": _fecha_corta(v["fecha"]),
+                                                "INGRESO AL CORREO": v.get("ingreso", "")} for k, v in est.items()]),
+                                 use_container_width=True, hide_index=True)
+                    if any(v["estado"] == "Pendiente de info" for v in est.values()):
+                        st.caption("Los recién registrados pueden tardar unos minutos en traer datos: volvé a consultar.")
+                elif not err:
+                    st.info("TrackingMore no devolvió datos para esos números.")
     with st.expander("🔎 Revisar importes de un pack / orden puntual"):
         ids_v = st.text_area("Pack IDs u órdenes de MeLi (uno por línea)", key="ids_venta", height=80)
         if st.button("Revisar", key="btn_revisar_venta") and ids_v.strip():
@@ -2125,6 +2343,20 @@ if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Gen
                 resto = [c for c in df.columns if c not in cols_cli]
                 pos = resto.index("FECHA") + 1 if "FECHA" in resto else len(resto)
                 df = df[resto[:pos] + cols_cli + resto[pos:]]
+                if consultar_correo:
+                    with st.spinner("📮 Consultando Correo Argentino..."):
+                        df, err_correo = agregar_estado_correo(df)
+                    if err_correo:
+                        st.warning(err_correo)
+                    trabados = df[(df["DIAS SIN MOVIMIENTO"].apply(lambda d: isinstance(d, int) and d >= dias_alerta))
+                                  & (~df["ESTADO CORREO ARGENTINO"].isin(["Entregado"]))]
+                    trabados = trabados.drop_duplicates(["MARCA", "PACK ID"])
+                    if len(trabados):
+                        st.warning(f"🚨 {len(trabados)} envíos sin movimiento hace {dias_alerta}+ días")
+                        st.dataframe(trabados[["MARCA", "PACK ID", "FECHA", "NUMERO DE SEGUIMIENTO",
+                                               "ESTADO CORREO ARGENTINO", "INGRESO AL CORREO", "ULTIMO MOVIMIENTO CORREO",
+                                               "FECHA ULTIMO MOVIMIENTO", "DIAS SIN MOVIMIENTO"]],
+                                     use_container_width=True, hide_index=True)
                 descargar_excel(df, "Ventas MeLi", f"Reporte_MeLi_{start_date}_al_{end_date}.xlsx", start_time,
                                 "ventas")
             elif tipo_meli == "Devoluciones":
