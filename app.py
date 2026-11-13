@@ -473,7 +473,7 @@ MELI_FALTANTES = [k for k in ("app_id", "client_secret", "fernet_key", "github_t
 @st.cache_resource
 def _estado_tokens():
     # Compartido por todas las sesiones del mismo servidor
-    return {"lock": threading.Lock(), "tokens": None, "sha": None}
+    return {"lock": threading.Lock(), "tokens": None, "sha": None, "pendiente": False, "error_guardado": ""}
 
 
 def _gh_headers():
@@ -519,21 +519,46 @@ def _cargar_tokens(estado):
 
 
 def _guardar_tokens(estado):
+    """Guarda los tokens cifrados en GitHub, con reintentos (GitHub a veces responde 403/409/5xx transitorios,
+    ej. 'Timed out validating the rule'). Si igual falla, queda marcado como pendiente y se reintenta
+    en la próxima consulta: los tokens nuevos siguen en memoria, así que el reporte no se corta."""
     _asegurar_rama()
     cifrado = Fernet(MELI_FERNET_KEY.encode()).encrypt(json.dumps(estado["tokens"]).encode())
     body = {"message": "tokens meli", "branch": GH_BRANCH, "content": base64.b64encode(cifrado).decode()}
-    if estado["sha"]:
-        body["sha"] = estado["sha"]
-    r = requests.put(_gh_url(), headers=_gh_headers(), json=body, timeout=20)
-    if r.status_code == 409 or (r.status_code == 422 and "sha" in r.text):
-        # sha desactualizado: tomamos el actual y reintentamos una vez
-        actual = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=20)
-        if actual.status_code == 200:
-            body["sha"] = actual.json()["sha"]
-            r = requests.put(_gh_url(), headers=_gh_headers(), json=body, timeout=20)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"No pude guardar los tokens en GitHub: HTTP {r.status_code} {r.text[:200]}")
-    estado["sha"] = r.json()["content"]["sha"]
+    ultimo = ""
+    for intento in range(5):
+        if estado["sha"]:
+            body["sha"] = estado["sha"]
+        try:
+            r = requests.put(_gh_url(), headers=_gh_headers(), json=body, timeout=30)
+        except requests.RequestException as e:
+            ultimo = str(e)[:150]
+            time_lib.sleep(2 * (intento + 1))
+            continue
+        if r.status_code in (200, 201):
+            estado["sha"] = r.json()["content"]["sha"]
+            estado["pendiente"] = False
+            return
+        ultimo = f"HTTP {r.status_code} {r.text[:200]}"
+        if r.status_code in (401, 404):
+            break  # token de GitHub inválido o sin permiso: reintentar no sirve
+        if r.status_code in (409, 422):
+            # sha desactualizado: tomamos el actual
+            actual = requests.get(_gh_url(), headers=_gh_headers(), params={"ref": GH_BRANCH}, timeout=20)
+            if actual.status_code == 200:
+                estado["sha"] = actual.json()["sha"]
+        time_lib.sleep(2 * (intento + 1))
+    estado["pendiente"] = True
+    estado["error_guardado"] = ultimo
+    raise RuntimeError(f"No pude guardar los tokens en GitHub: {ultimo}")
+
+
+def _guardar_si_pendiente(estado):
+    if estado.get("pendiente"):
+        try:
+            _guardar_tokens(estado)
+        except RuntimeError:
+            pass
 
 
 def _pedir_token(data):
@@ -575,6 +600,7 @@ def token_vigente(marca, forzar=False):
         tok = tokens.get(marca)
         if not tok:
             raise RuntimeError("Cuenta no conectada. Conectala en '⚙️ Cuentas de MercadoLibre'.")
+        _guardar_si_pendiente(estado)
         if not forzar and tok["expires_at"] - time_lib.time() > 1800:
             return tok
         d = _pedir_token({"grant_type": "refresh_token", "client_id": MELI_APP_ID,
@@ -582,8 +608,12 @@ def token_vigente(marca, forzar=False):
         tokens[marca] = {**tok, "access_token": d["access_token"],
                          "refresh_token": d.get("refresh_token", tok["refresh_token"]),
                          "expires_at": int(time_lib.time()) + int(d.get("expires_in", 21600))}
-        # El refresh viejo ya no sirve: se guarda el nuevo inmediatamente
-        _guardar_tokens(estado)
+        # El refresh viejo ya no sirve: se guarda el nuevo inmediatamente. Si GitHub falla, el token nuevo
+        # queda en memoria (el reporte sigue) y se reintenta guardar en la próxima consulta.
+        try:
+            _guardar_tokens(estado)
+        except RuntimeError:
+            pass
         return tokens[marca]
 
 
@@ -2327,6 +2357,13 @@ if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Gen
         progress_bar.empty()
         status_placeholder.empty()
         chips_marcas(resultados)
+        if canal == "MercadoLibre":
+            _est_tk = _estado_tokens()
+            _guardar_si_pendiente(_est_tk)
+            if _est_tk.get("pendiente"):
+                st.warning("⚠️ El reporte salió bien, pero GitHub no dejó guardar los tokens renovados de MeLi "
+                           f"({_est_tk.get('error_guardado', '')[:120]}). La app lo reintenta sola; si este aviso "
+                           "persiste, no reinicies la app y avisame.")
 
         if all_data:
             df = pd.DataFrame(all_data)
