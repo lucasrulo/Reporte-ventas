@@ -1892,16 +1892,17 @@ def _fecha_correo(txt):
 
 def consultar_correo_directo(numero):
     """Consulta la web pública de seguimiento de Correo Argentino (envíos de MercadoLibre)."""
-    for intento in range(3):
+    err = ""
+    for intento in range(2):
         try:
-            r = requests.post(CA_URL, data={"action": "mercadolibre", "id": numero}, headers=CA_HEADERS, timeout=25)
+            r = requests.post(CA_URL, data={"action": "mercadolibre", "id": numero}, headers=CA_HEADERS, timeout=12)
         except requests.RequestException as e:
             err = str(e)[:120]
-            time_lib.sleep(2 * (intento + 1))
+            time_lib.sleep(1.5)
             continue
         if r.status_code != 200 or "<table" not in r.text and "pieza" not in r.text:
             err = f"HTTP {r.status_code}"
-            time_lib.sleep(2 * (intento + 1))
+            time_lib.sleep(1.5)
             continue
         eventos = _parse_correo(r.text)
         ingreso = next((e for e in reversed(eventos) if "INGRESO AL CORREO" in e["estado"].upper()), None)
@@ -1916,25 +1917,55 @@ def consultar_correo_directo(numero):
     return {"_error": err}
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def estados_correo(numeros):
-    """Estado de cada envío consultando directo a Correo Argentino; si falla y hay TrackingMore, usa eso."""
+@st.cache_resource
+def _cache_correo():
+    # {numero: (timestamp, resultado)} compartido entre sesiones del servidor
+    return {}
+
+
+def estados_correo(numeros, progreso=None):
+    """Estado de cada envío consultando directo a Correo Argentino (con caché por número).
+    Entregados se guardan 24 hs; el resto 30 min. Si falla y hay TrackingMore, usa eso."""
     numeros = [n for n in dict.fromkeys(str(x).strip() for x in numeros) if n]
     if not numeros:
         return {}, ""
-    out, errores = {}, []
-    with ThreadPoolExecutor(max_workers=4) as ex:   # pocas consultas en paralelo, para no saturar la web
-        for n, res in zip(numeros, ex.map(consultar_correo_directo, numeros)):
+    cache, ahora = _cache_correo(), time_lib.time()
+    out, faltan = {}, []
+    for n in numeros:
+        c = cache.get(n)
+        vida = 86400 if c and c[1].get("estado") == "Entregado" else 1800
+        if c and ahora - c[0] < vida:
+            out[n] = c[1]
+        else:
+            faltan.append(n)
+
+    errores, hechos, total = [], 0, len(faltan)
+    if progreso and total:
+        progreso(0, total)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futuros = {ex.submit(consultar_correo_directo, n): n for n in faltan}
+        from concurrent.futures import as_completed
+        for fut in as_completed(futuros):
+            n = futuros[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = {"_error": str(e)[:100]}
             if res.get("_error"):
                 errores.append(n)
             else:
                 out[n] = res
+                cache[n] = (time_lib.time(), res)
+            hechos += 1
+            if progreso and (hechos % 10 == 0 or hechos == total):
+                progreso(hechos, total)
     if errores and TM_KEY:
         extra, err_tm = estados_trackingmore(tuple(errores))
         out.update(extra)
         errores = [n for n in errores if n not in extra]
     error = (f"No pude consultar {len(errores)} de {len(numeros)} envíos en la web de Correo Argentino "
-             "(puede estar bloqueando consultas automáticas o caída).") if errores else ""
+             "(puede estar lenta o bloqueando consultas). Volvé a generar el reporte: los ya consultados "
+             "quedan guardados y solo se reintentan los que faltan.") if errores else ""
     return out, error
 
 
@@ -1974,13 +2005,13 @@ def estados_trackingmore(numeros):
     return out, error
 
 
-def agregar_estado_correo(df):
+def agregar_estado_correo(df, progreso=None):
     """Suma ESTADO CORREO ARGENTINO / ULTIMO MOVIMIENTO / FECHA / DIAS SIN MOVIMIENTO a Ventas MeLi,
     para todos los envíos con número de seguimiento del rango de fechas del reporte."""
     if "NUMERO DE SEGUIMIENTO" not in df.columns:
         return df, ""
     pend = df[df["NUMERO DE SEGUIMIENTO"].astype(str).str.strip() != ""]   # todos los envíos del reporte
-    estados, error = estados_correo(tuple(sorted(set(pend["NUMERO DE SEGUIMIENTO"].astype(str)))))
+    estados, error = estados_correo(tuple(sorted(set(pend["NUMERO DE SEGUIMIENTO"].astype(str)))), progreso)
     ahora = datetime.now(ZONA_AR)
 
     def _dias(f):
@@ -2383,8 +2414,18 @@ if st.button(f"🚀  {_txt_boton[tipo_meli] if canal == 'MercadoLibre' else 'Gen
                 pos = resto.index("FECHA") + 1 if "FECHA" in resto else len(resto)
                 df = df[resto[:pos] + cols_cli + resto[pos:]]
                 if consultar_correo:
-                    with st.spinner("📮 Consultando Correo Argentino..."):
-                        df, err_correo = agregar_estado_correo(df)
+                    barra_ca = st.progress(0.0, text="📮 Consultando Correo Argentino...")
+                    t0_ca = time_lib.time()
+
+                    def _prog_ca(hechos, total):
+                        resto = ""
+                        if hechos:
+                            seg = (time_lib.time() - t0_ca) / hechos * (total - hechos)
+                            resto = f" · faltan ~{int(seg // 60)} min {int(seg % 60)} s"
+                        barra_ca.progress(hechos / total if total else 1.0,
+                                          text=f"📮 Correo Argentino: {hechos} de {total} envíos{resto}")
+                    df, err_correo = agregar_estado_correo(df, _prog_ca)
+                    barra_ca.empty()
                     if err_correo:
                         st.warning(err_correo)
                     trabados = df[(df["DIAS SIN MOVIMIENTO"].apply(lambda d: isinstance(d, int) and d >= dias_alerta))
